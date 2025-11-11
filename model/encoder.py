@@ -7,7 +7,7 @@ class nconv(nn.Module):
     def __init__(self):
         super(nconv,self).__init__()
     def forward(self, x, A):
-        x = torch.einsum('bcnt,nv->bcvl', (x, A))
+        x = torch.einsum('bcnt,nv->bcvt', (x, A))
         return x.contiguous()
 
 class graph_constructor(nn.Module):
@@ -40,8 +40,8 @@ class graph_constructor(nn.Module):
 
         nodevec1 = torch.tanh(self.alpha * self.lin1(nodevec1))
         nodevec2 = torch.tanh(self.alpha * self.lin2(nodevec2))
-        a = torch.mm(nodevec1, nodevec2.transpose(0,1)) - \
-            torch.mm(nodevec2, nodevec1.transpose(0,1))
+        a = torch.mm(nodevec1, nodevec2.transpose(1,0)) - \
+            torch.mm(nodevec2, nodevec1.transpose(1,0))
         adj = F.relu(torch.tanh(self.alpha * a))
 
         #top-k 稀疏化
@@ -55,13 +55,13 @@ class graph_constructor(nn.Module):
 class GraphConvLayer(nn.Module):
     def __init__(self, in_dim, out_dim, dropout=0.3, alpha=0.05):
         super(GraphConvLayer, self).__init__()
-        self.ncov = nconv()
+        self.nconv = nconv()
         self.mlp = nn.Linear(in_dim, out_dim)
         self.dropout = nn.Dropout(dropout)
         self.alpha = alpha
     def forward(self, x, adj, mask=None):
         #归一化邻接矩阵
-        adj = adj + torch.eye(adj.size(0).to(x.device))
+        adj = adj + torch.eye(adj.size(0)).to(x.device)
         d = adj.sum(1)
         a = adj / d.view(-1,1)
 
@@ -69,7 +69,7 @@ class GraphConvLayer(nn.Module):
         x_gcn = x.unsqueeze(-1).permute(0,2,1,3)
 
         #图卷积：(B,C,N,1)@(N,N)->(B,C,N,1)
-        h = self.ncov(x_gcn, a)
+        h = self.nconv(x_gcn, a)
 
         #转回：(B,C,N,1)->(B,N,C)
         h = h.squeeze(-1).permute(0,2,1)
@@ -262,7 +262,7 @@ class EmbeddingExpander(nn.Module):
         优先级：预定义 > 自适应图学习 > 单位矩阵
         """
         if self.predefined_adj is not None:
-            return self.predefined_adj_normalized
+            return self.predefined_adj
         elif self.use_adaptive_graph:
             return self.graph_constructor(idx)
         else:
@@ -301,26 +301,26 @@ class EmbeddingExpander(nn.Module):
         for i, layer in enumerate(self.graph_layers):
             h_masked = h * active_mask
 
-        active_mask_for_adj = active_mask[0].squeeze(-1) #(N,)
-        adj_directed = adj * active_mask_for_adj.unsqueeze(0) #(N, N) * (1, N) -> (N, N)
+            active_mask_for_adj = active_mask[0].squeeze(-1) #(N,)
+            adj_directed = adj * active_mask_for_adj.unsqueeze(0) #(N, N) * (1, N) -> (N, N)
 
-        h = layer(h_masked, adj_directed, mask= None)
+            h = layer(h_masked, adj_directed, mask= None)
 
-        if i < len(self.graph_layers) - 1:
-            neighbor_scores = torch.matmul(
-                active_mask.squeeze(-1).float(),
-                adj_normalized
-            )
-            if self.diffusion_type == 'soft':
-                alpha_layer = self.diffusion_alpha * (self.diffusion_decay ** i)
-                active_mask = torch.clamp(
-                    active_mask + alpha_layer * neighbor_scores.unsqueeze(-1),
-                    0.0, 1.0
+            if i < len(self.graph_layers) - 1:
+                neighbor_scores = torch.matmul(
+                    active_mask.squeeze(-1).float(),
+                    adj_normalized
                 )
-            else:
-                threshold = self.diffusion_threshold * (self.diffusion_decay ** i)
-                new_active = (neighbor_scores > threshold).float().unsqueeze(-1)
-                active_mask = torch.maximum(active_mask, new_active)
+                if self.diffusion_type == 'soft':
+                    alpha_layer = self.diffusion_alpha * (self.diffusion_decay ** i)
+                    active_mask = torch.clamp(
+                        active_mask + alpha_layer * neighbor_scores.unsqueeze(-1),
+                        0.0, 1.0
+                    )
+                else:
+                    threshold = self.diffusion_threshold * (self.diffusion_decay ** i)
+                    new_active = (neighbor_scores > threshold).float().unsqueeze(-1)
+                    active_mask = torch.maximum(active_mask, new_active)
         h = h * (1 - mask) + full_embedding * mask
         return h 
         
