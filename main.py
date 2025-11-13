@@ -197,7 +197,7 @@ parser.add_argument('--w_gan', type=float, default=0.1, help='GAN损失权重（
 parser.add_argument('--save_discriminator', type=str_to_bool, default=True, help='是否保存判别器')
 
 # --- 预测解码器参数 ---
-parser.add_argument('--decoder_type', type=str, default='lstm', choices=['lstm', 'tcn'],
+parser.add_argument('--decoder_type', type=str, default='lstm', choices=['lstm', 'tcn', 'graph_tcn'],
                     help='预测解码器类型：lstm(默认) 或 tcn(Graph-aware TCN)')
 parser.add_argument('--tcn_kernel_size', type=int, default=3, help='TCN卷积核大小')
 parser.add_argument('--tcn_num_layers', type=int, default=4, help='TCN层数')
@@ -306,6 +306,8 @@ def main(runid):
 
     if not os.path.exists(args.path_model_save):
         os.makedirs(args.path_model_save)
+    if not os.path.exists("./log"):
+        os.makedirs("./log")
     # 模型参数配置（变量子集预测版本）
     model_params = {
         'seq_in_len': args.seq_in_len,
@@ -367,6 +369,8 @@ def main(runid):
             print(f" * 衰减系数: {args.diffusion_decay}")
     generator, discriminator = build_gan_models(model_params)
     # 创建 GAN 训练器
+    generator = generator.to(device)
+    discriminator = discriminator.to(device)
     engine = create_gan_trainer(
         args=args,
         generator=generator,

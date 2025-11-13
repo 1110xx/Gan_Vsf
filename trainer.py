@@ -169,15 +169,10 @@ class GAN_Trainer():
             # 获取全局embedding
             global_embedding = self.generator.encoder(input_subset, idx, args)
             # 预测分支：保持梯度流向
-            pred_input = global_embedding.unsqueeze(2).repeat(1, 1, self.generator.seq_out_len, 1)
-            pred_input = pred_input.reshape(batch_size * self.generator.num_nodes, self.generator.seq_out_len, -1)
-            pred_lstm_out, _ = self.generator.pred_decoder_lstm(pred_input)
-            prediction_raw = self.generator.pred_output(pred_lstm_out)
-            pred_output = prediction_raw.reshape(batch_size, self.generator.num_nodes, self.generator.seq_out_len, 1)
-            pred_output = pred_output.permute(0, 3, 1, 2)
+            adj = self.generator.encoder.embedding_expander.get_adjacency_matrix()
+            pred_output = self.generator.pred_decoder(global_embedding,adj)
             # 重构分支：截断梯度 ⭐
             global_embedding_detached = global_embedding.detach()
-            adj = self.generator.encoder.embedding_expander.get_adjacency_matrix()
             recon_output = self.generator.recon_decoder(global_embedding_detached, adj)
         # pred_output: (B, 1, N_all, T) - 全局预测（重构后）
         # recon_output: (B, F, N_all, T) - 全局重构

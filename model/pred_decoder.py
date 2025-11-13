@@ -581,6 +581,14 @@ class PredictionDecoder(nn.Module):
             self.decoder = GraphAwareTCN(params)
 
             print("✓ Using Graph-aware TCN Decoder")
+        
+        elif self.decoder_type == 'graph_tcn':
+
+            # 使用 Graph-aware TCN 解码器
+
+            self.decoder = GraphTCNPredictionDecoder(params)
+
+            print("✓ Using Graph-aware TCN Decoder")
 
         else:
 
@@ -607,7 +615,9 @@ class PredictionDecoder(nn.Module):
             # 输出层
 
             self.output_layer = nn.Linear(self.decoder_units, 1)
-
+            self.time_embedding = nn.Parameter(
+                torch.randn(1, 1, self.seq_out_len, self.embedding_dim) * 0.01
+            )
             print("✓ Using LSTM Decoder")
 
 
@@ -628,13 +638,13 @@ class PredictionDecoder(nn.Module):
 
         """
 
-        if self.decoder_type == 'tcn':
+        if self.decoder_type in ['tcn', 'graph_tcn']:
 
         # ========== TCN 解码 ==========
 
             if adj is None:
 
-                raise ValueError("TCN decoder requires adjacency matrix (adj)")
+                raise ValueError(f"{self.decoder_type} decoder requires adjacency matrix (adj)")
 
             prediction = self.decoder(global_embedding, adj)
 
@@ -651,6 +661,7 @@ class PredictionDecoder(nn.Module):
             # (B, N_all, dim) -> (B, N_all, T_out, dim)
 
             pred_input = global_embedding.unsqueeze(2).repeat(1, 1, self.seq_out_len, 1)
+            pred_input = pred_input + self.time_embedding
 
             # 步骤2: Reshape for LSTM
 
@@ -683,3 +694,112 @@ class PredictionDecoder(nn.Module):
             prediction = prediction.permute(0, 3, 1, 2)
 
             return prediction
+class GraphTCNPredictionDecoder(nn.Module):
+    """
+    Graph-TCN 预测解码器（优化版）
+    特点:
+    - TCN 代替 LSTM（捕获长时依赖）
+    - 每层 TCN 后接图卷积
+    - 残差连接 + LayerNorm + Dropout
+    - 可学习时间位置编码
+    输入:
+    global_emb : (B, N_all, dim)
+    adj : (N_all, N_all)
+    输出:
+    pred_out : (B, 1, N_all, T_out)
+    """
+    def __init__(self, params):
+        super().__init__()
+        # 基本参数
+        self.seq_out_len = params['seq_out_len']
+        self.num_nodes = params['num_nodes']
+        self.embedding_dim = params.get('encoder_lstm_units', 128) + params.get('conv_filters', 64)
+        # TCN 参数
+        self.hidden_dim = params.get('tcn_hidden_dim', 64)
+        self.tcn_layers = params.get('tcn_num_layers', 3)
+        self.kernel_size = params.get('tcn_kernel_size', 3)
+        self.dropout = params.get('tcn_dropout', 0.1)
+        # 投影层
+        self.input_proj = nn.Linear(self.embedding_dim, self.hidden_dim)
+        self.input_ln = nn.LayerNorm(self.hidden_dim)
+        # 可学习时间位置编码
+        self.time_pos = nn.Parameter(
+        torch.randn(self.seq_out_len, self.hidden_dim) * 0.01
+        )
+        # TCN 模块
+        self.tcn_blocks = nn.ModuleList()
+        self.tcn_norms = nn.ModuleList()
+        for i in range(self.tcn_layers):
+            dilation = 2 ** i
+            padding = (self.kernel_size - 1) * dilation
+            conv = nn.Conv1d(
+            self.hidden_dim, self.hidden_dim,
+            kernel_size=self.kernel_size,
+            padding=padding,
+            dilation=dilation
+            )
+            self.tcn_blocks.append(conv)
+            self.tcn_norms.append(nn.LayerNorm([self.hidden_dim, self.seq_out_len]))
+        self.dropout_layer = nn.Dropout(self.dropout)
+        # 图卷积后投影
+        self.graph_proj = nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=1)
+        self.graph_conv = LightGraphConv(self.hidden_dim)
+        # 输出头
+        self.head = nn.Sequential(
+        nn.Linear(self.hidden_dim, self.hidden_dim // 2),
+        nn.ReLU(),
+        nn.Dropout(self.dropout),
+        nn.Linear(self.hidden_dim // 2, 1)
+        )
+        # 初始化
+        nn.init.xavier_uniform_(self.input_proj.weight)
+        nn.init.zeros_(self.input_proj.bias)
+        print("✓ Using Graph-TCN Decoder (Optimized)")
+    def forward(self, global_emb, adj):
+        """
+        global_emb: (B, N_all, dim)
+        adj: (N_all, N_all)
+        """
+        B, N, D = global_emb.shape
+        # 输入投影
+        x = self.input_proj(global_emb) # (B, N, H)
+        x = self.input_ln(x)
+        x = F.relu(x)
+        # 扩展到时间维度 + 位置编码
+        x = x.unsqueeze(2).repeat(1, 1, self.seq_out_len, 1) # (B, N, T, H)
+        x = x + self.time_pos.unsqueeze(0).unsqueeze(0) # 广播到 (B, N, T, H)
+        # Reshape for TCN: (B, N, T, H) -> (B*N, H, T)
+        x = x.permute(0, 1, 3, 2).reshape(B * N, self.hidden_dim, self.seq_out_len)
+        # TCN + Graph 层
+        for conv, ln in zip(self.tcn_blocks, self.tcn_norms):
+            residual = x
+            # TCN
+            out = conv(x)
+            if out.size(-1) > self.seq_out_len:
+                out = out[:, :, -self.seq_out_len:] # 截断到正确长度
+            out = F.relu(out)
+            out = self.dropout_layer(out)
+            # Reshape for graph conv: (B*N, H, T) -> (B, N, H, T)
+            out_g = out.reshape(B, N, self.hidden_dim, self.seq_out_len)
+            # 图卷积: (B, N, H, T) -> (B, N, H, T)
+            out_g = self.graph_conv(out_g, adj)
+            # Conv2d投影: 转换为 (B, H, N, T) 格式
+            out_g = out_g.permute(0, 2, 1, 3) # (B, N, H, T) -> (B, H, N, T)
+            out_g = self.graph_proj(out_g) # (B, H, N, T)
+            out_g = out_g.permute(0, 2, 1, 3) # (B, H, N, T) -> (B, N, H, T)
+            # Reshape back: (B, N, H, T) -> (B*N, H, T)
+            out = out_g.reshape(B * N, self.hidden_dim, self.seq_out_len)
+            # 残差连接
+            if out.shape == residual.shape:
+                x = 0.5 * (out + residual)
+            else:
+                x = out
+        # Reshape to (B, N, T, H)
+        x = x.reshape(B, N, self.hidden_dim, self.seq_out_len).permute(0, 1, 3, 2)
+        # 输出头: (B, N, T, H) -> (B, N, T, 1)
+        x_flat = x.reshape(B * N * self.seq_out_len, self.hidden_dim)
+        out_flat = self.head(x_flat)
+        pred = out_flat.reshape(B, N, self.seq_out_len, 1)
+        # 转换到标准格式: (B, N, T, 1) -> (B, 1, N, T)
+        pred = pred.permute(0, 3, 1, 2)
+        return pred
