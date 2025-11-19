@@ -543,8 +543,17 @@ class ImprovedEmbeddingExpander(nn.Module):
             # Confidence-based融合
             # 观测节点：保留原始信息为主，GCN为辅
             # 未观测节点：GCN信息为主
-            h = confidence * (gate * h_prev + (1 - gate) * h_gcn) + \
-                (1 - confidence) * h_gcn
+            if h_prev.size(-1) == h_gcn.size(-1):
+                # 维度相同：gate控制h_prev和h_gcn的融合比例
+                h_intermediate = gate * h_prev + (1 - gate) * h_gcn
+            else:
+                # 维度不同：直接使用h_gcn（维度已通过GCN层转换）
+                h_intermediate = gate * h_gcn
+
+                # 根据confidence决定观测节点和未观测节点的策略
+                # 观测节点：使用gate控制的融合结果
+                # 未观测节点：直接使用GCN输出
+            h = confidence * h_intermediate + (1 - confidence) * h_gcn
 
             # 传播confidence（邻居传播）
             if i < len(self.graph_layers) - 1:
@@ -598,6 +607,7 @@ class GlobalEmbeddingEncoder(nn.Module):
         self.subset_encoder = SubsetEncoder(params)
         self.embedding_expander = EmbeddingExpander(params)
         self.embedding_dim = self.subset_encoder.embedding_dim
+
     def forward(self, x, idx_subset, args=None):
         """
         Args:
