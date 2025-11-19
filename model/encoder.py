@@ -605,8 +605,26 @@ class GlobalEmbeddingEncoder(nn.Module):
     def __init__(self, params):
         super(GlobalEmbeddingEncoder, self).__init__()
         self.subset_encoder = SubsetEncoder(params)
-        self.embedding_expander = EmbeddingExpander(params)
+        # 检查 是否使用 imputer
+        self.use_imputer = params.get('use_embedding_imputer', False)
+
+        if self.use_imputer:
+            # 使用 GRUI Imputer
+            try:
+                from .embedding_imputer import EmbeddingImpacter
+                self.impacter = EmbeddingImpacter(params)
+                print("使用 GRUImpacter 进行缺失值填充")
+            except ImportError:
+                raise ImportError("GRUImpacter 模块未找到，请检查是否已安装")
+                self.use_imputer = False
+                self.embedding_expander = EmbeddingExpander(params)
+        else:
+            self.embedding_expander = EmbeddingExpander(params)
+            print("使用 EmbeddingExpander 进行缺失值填充")
+
+        
         self.embedding_dim = self.subset_encoder.embedding_dim
+            
 
     def forward(self, x, idx_subset, args=None):
         """
@@ -617,5 +635,9 @@ class GlobalEmbeddingEncoder(nn.Module):
             global_embedding: (B, N_all, embedding_dim)
         """
         subset_embedding = self.subset_encoder(x)
-        global_embedding = self.embedding_expander(subset_embedding, idx_subset, args)
+        if self.use_imputer:
+            global_embedding = self.impacter(subset_embedding, idx_subset, args)
+        else:
+            global_embedding = self.embedding_expander(subset_embedding, idx_subset, args)
+
         return global_embedding

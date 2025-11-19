@@ -366,8 +366,172 @@ class GAN_Trainer():
         self.discriminator_optimizer.load_state_dict(checkpoint['discriminator_optimizer_state_dict'])
         print(f'模型已加载自 {load_path}')
         return checkpoint['epoch']
+#=============================================================
+# GRUI Imputer 两阶段训练
+#=============================================================
 
+    def pretrain_imputer(self,args,dataloader):
+        """
+        阶段1：预训练 Imputer (无对抗训练)
+        目标：学习补全 embedding
+        损失：重构损失+掩码MSE
 
+        Args:
+            args: 参数设置
+            dataloader: 训练数据加载器
+        """
+        if not hasattr(self.generator.encoder, 'use_imputer') or not self.generator.encoder.use_imputer:
+            print("Warning: Imputer not enable,skipping pretrain")
+            return 
+        print("\n"+"="*70)
+        print("阶段1：预训练 GRUI Imputer")
+        print("="*70+"\n")
+
+        imputer = self.generator.encoder.imputer
+        # Imputer 优化器
+        imputer_optimizer = torch.optim.Adam(
+            imputer.generator.parameters(),
+            lr=args.imputer_learning_rate,
+            weight_decay=args.weight_decay
+        )
+        for epoch in range(1, args.imputer_pretrain_epochs +1):
+            imputer.generator.train()
+            epoch_recon_loss =[]
+            epoch_mask_mse = []
+            dataloader.shuffle()
+            for iter_idx, (x,y) in enumerate(dataloader.get_iterator()):
+                trainx = torch.Tensor(x).to(self.device)
+                trainx = trainx.transpose(1,3) #(B,F,N,T)
+
+                # 随机选择子集
+                perm = np.random.permutation(range(args.num_nodes))
+                num_sub = int(args.num_nodes / args.num_split)
+                idx = perm[:num_sub]
+                idx = torch.tensor(idx).to(self.device)
+
+                # 提取子集
+                tx_subset =trainx[:, :, idx, :] 
+                # (B,F,N_subset,T)
+
+                # 编码子集得到 subset_embedding
+                subset_embedding = self.generator.encoder.subset_encoder(tx_subset) 
+                # (B, N_subset,D)
+
+                # 使用 imputer 补全
+                completed_emb, partial_emb, mask, delta = imputer.forward_train(subset_embedding, idx)
+
+                # 损失1：重构损失
+                mask_expanded = mask.unsqueeze(-1) 
+                # (B,N,1)
+                loss_recon = ((completed_emb - partial_emb)*mask_expanded).pow(2).mean()
+                # 损失2：掩码MSE
+                loss_mask_mse = loss_recon
+
+                loss = args.imupter_recon_lambda * loss_recon + args.imputer_mask_lambda * loss_mask_mse
+
+                # 反向传播
+                imputer_optimizer.zero_grad()
+                loss.backward()
+                if self.clip is not None:
+                    torch.nn.utils.clip_grad_norm_(imputer.generator.parameters(), self.clip)
+                imputer_optimizer.step()
+
+                epoch_recon_loss.append(loss_recon.item())
+                epoch_mask_mse.append(loss_mask_mse.item())
+
+                if iter_idx % args.print_every ==0 :
+                    print(f"Epoch {epoch}/{args.imputer_pretrain_epochs}, Iter {iter_idx}, "
+                          f"Recon Loss: {loss_recon.item():.4f}, Mask MSE: {loss_mask_mse.item():.4f}")
+            avg_recon = np.mean(epoch_recon_loss)
+            avg_mse = np.mean(epoch_mask_mse)
+            print(f"Epoch {epoch}/{args.imputer_pretrain_epochs} Complete, "
+                  f"Avg Recon Loss: {avg_recon:.4f}, Avg Mask MSE: {avg_mse:.4f}")
+        print("\n"+"="*70)
+        print("阶段1：Imputer预训练完成")
+        print("="*70+"\n")
+    def train_with_imputer_adversarial(self, args, input_subset, input_full, real_val, idx=None):
+        """
+        阶段2：带 Imupter 对抗训练
+        Args:
+            args
+            input_subset
+            input_full
+            real_val
+            idx
+        return:
+            主训练指标 + Imputer 指标
+        """
+        if not hasattr(self.generator.encoder,'use_imputer') or not self.generator.encoder.use_imputer:
+            return self.train(args, input_subset, input_full, real_val, idx)
+        imputer = self.generator.encoder.imputer
+        # 创建Iputer优化
+
+        if not hasattr(self, 'imputer_g_optimizer'):
+            self.imputer_g_optimizer = torch.optim.Adam(
+                imputer.generator.parameters(),
+                lr=args.imputer_learning_rate,
+                weight_decay=args.weight_decay
+            )
+            self.imputer_d_optimizer = torch.optim.Adam(
+                imputer.discriminator.parameters(),
+                lr=args.imputer_learning_rate,
+                weight_decay=args.weight_decay
+            )
+        batch_size = input_subset.size(0)
+
+        # 步骤1： 训练 D
+        imputer_d_loss_total = 0
+        for _ in range(args.imupter_d_steps):
+            self.imputer_d_optimizer.zero_grad()
+
+            # 获取 subset embedding
+            with torch.no_grad():
+                subset_embedding = self.generator.encoder.subset_encoder(input_subset)
+            # 真实 embedding （完整的） - 需要用完整数据集
+            real_subset_emb = self.generator.encoder.subset_encoder(input_full)
+            real_completed_emb, real_partial, real_mask, real_delta = imputer.forward_train(
+                real_subset_emb, torch.arange(args.num_nodes).to(self.device)
+            )   
+            # 生成假的 embedding
+            with torch.no_grad():
+                fake_completed_emb, fake_partial, fake_delta = imputer.forward_train(subset_embedding, idx)
+            # 辨别器评分 
+            d_real = imputer.discriminator(real_completed_emb, real_mask, real_delta)
+            d_fake = imputer.discriminator(fake_completed_emb, real_mask, fake_delta)
+
+            #辨别器损失
+            loss_d = -torch.mean(d_real) + torch.mean(d_fake)
+
+            loss_d.backward()
+            if self.clip is not None:
+                torch.nn.utils.clip_grad_norm_(imputer.discriminator.parameters(), self.clip)
+            self.imputer_d_optimizer.step()
+
+            imputer_d_loss_total +=loss_d.item()
+        imputer_d_loss_avg = imputer_d_loss_total / args.imputer_d_steps
+        # 步骤2：训练G
+        self.imputer_g_optimizer.zero_grad()
+
+        subset_embedding = self.generator.encoder.subset_encoder(input_subset)
+        completed_emb, partial_emb, mask, delta = imputer.forward_train(subset_embedding, idx)
+        # G 损失
+        d_fake = imputer.discriminator(completed_emb, mask, delta)
+        loss_adv = -torch.mean(d_fake)
+
+        mask_expanded = mask.unsqurrze(-1)
+        loss_recon = ((completed_emb - partial_emb)*mask_expanded).pow(2).mean()
+
+        loss_g = loss_adv + args.imputer_recon_lambda * loss_recon
+
+        loss_g.backward()
+        if self.clip is not None:
+            torch.nn.utils.clip_grad_norm_(imputer.generator.parameters(), self.clip)
+        self.imputer_g_optimizer.step()
+
+        # 步骤3
+        main_metrics = self.train(args, input_subset, input_full, real_val, idx)
+
+        return main_metrics + (loss_g.item(), imputer_d_loss_avg, loss_recon.item())
 def adjust_learning_rate(optimizer, args):
     """学习率调整函数 - 与TOI-VSF保持一致"""
     # 如果没有指定学习率调整策略，直接返回

@@ -123,8 +123,10 @@ class SpatioTemporalGenerator(nn.Module):
         # global_embedding: (B, N_all, embedding_dim)
 
         # ========== 步骤2: 获取邻接矩阵 ==========
-
-        adj = self.encoder.embedding_expander.get_adjacency_matrix()
+        if hasattr(self.encoder, 'use_imputer') and self.encoder.use_imputer:
+            adj = self.encoder.impacter.get_adjacency_matrix()
+        else:
+            adj = self.encoder.embedding_expander.get_adjacency_matrix()
 
         # adj: (N_all, N_all)
 

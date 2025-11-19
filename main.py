@@ -346,6 +346,10 @@ def main(runid):
         'diffusion_alpha': args.diffusion_alpha,
         'diffusion_decay': args.diffusion_decay,
         'diffusion_threshold': args.diffusion_threshold,
+        # GRUI 参数
+        'use_embedding_imputer': args.use_embedding_imputer,
+        'imputer_hidden_dim': args.imputer_hidden_dim,
+        'imputer_z_dim': args.imputer_z_dim,
     }
     print(f"\n模型配置：")
     print(f" 完整集节点数: {args.num_nodes}")
@@ -384,6 +388,15 @@ def main(runid):
         device=device,
         cl=True  # 启用课程学习
     )
+    if args.use_embedding_imputer and not args.skip_imputer_pretrain:
+        print("\n" + "="*70)
+        print(" 启动 GRUI Imputer 两阶段 训练")
+        print("="*70)
+        engine.pretrain_imputer(args, dataloader['train_loader'])
+        print("阶段1完成：Imputer 预训练")
+        print("进入第二阶段: GAN 对抗训练")
+        print("="*70 +"\n")
+    
     # ============================================================
     # 训练循环初始化 - 与GIMCC结构完全相同
     # ============================================================
