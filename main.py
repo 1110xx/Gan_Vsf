@@ -176,6 +176,26 @@ parser.add_argument('--distil', action='store_false',
                     default=True)
 parser.add_argument('--activation', type=str, default='gelu', help='activation')
 # ------new----------------------------------------------------
+parser.add_argument('--use_embedding_imputer', type=str_to_bool, default=False,
+                    help='使用 GRUI Imputer 替代 EmbeddingExpander')
+parser.add_argument('--imputer_hidden_dim', type=int, default=128,
+                    help='Imputer GRUI 隐状态维度')
+parser.add_argument('--imputer_z_dim', type=int, default=32,
+                    help='Imputer 噪声向量维度（用于推理优化）')
+parser.add_argument('--imputer_pretrain_epochs', type=int, default=20,
+                    help='Imputer 预训练轮数（阶段1）')
+parser.add_argument('--skip_imputer_pretrain', type=str_to_bool, default=False,
+                    help='跳过 Imputer 预训练（直接进入对抗训练）')
+parser.add_argument('--imputer_recon_lambda', type=float, default=1.0,
+                    help='Imputer 重构损失权重')
+parser.add_argument('--imputer_mask_lambda', type=float, default=1.0,
+                    help='Imputer 掩码MSE损失权重')
+parser.add_argument('--imputer_gan_lambda', type=float, default=0.1,
+                    help='Imputer GAN损失权重（阶段2）')
+parser.add_argument('--imputer_d_steps', type=int, default=5,
+                    help='每个 Imputer Generator step 前的 Discriminator steps')
+parser.add_argument('--imputer_learning_rate', type=float, default=0.001,
+                    help='Imputer 学习率')
 
 # --- 训练参数 ---
 parser.add_argument('--batch_size', type=int, default=64, help='批次大小')

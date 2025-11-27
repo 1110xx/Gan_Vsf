@@ -427,7 +427,7 @@ class GAN_Trainer():
                 # 损失2：掩码MSE
                 loss_mask_mse = loss_recon
 
-                loss = args.imupter_recon_lambda * loss_recon + args.imputer_mask_lambda * loss_mask_mse
+                loss = args.imputer_recon_lambda * loss_recon + args.imputer_mask_lambda * loss_mask_mse
 
                 # 反向传播
                 imputer_optimizer.zero_grad()
@@ -451,7 +451,7 @@ class GAN_Trainer():
         print("="*70+"\n")
     def train_with_imputer_adversarial(self, args, input_subset, input_full, real_val, idx=None):
         """
-        阶段2：带 Imupter 对抗训练
+        阶段2：带 imputer 对抗训练
         Args:
             args
             input_subset
@@ -481,7 +481,7 @@ class GAN_Trainer():
 
         # 步骤1： 训练 D
         imputer_d_loss_total = 0
-        for _ in range(args.imupter_d_steps):
+        for _ in range(args.imputer_d_steps):
             self.imputer_d_optimizer.zero_grad()
 
             # 获取 subset embedding
