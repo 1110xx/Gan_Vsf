@@ -34,10 +34,9 @@ def compute_discriminator_loss(score_real, score_fake):
 
 
 def compute_generator_loss(score_fake, x_fake, x_real, mask, lambda_rec=1.0, lambda_adv=0.1):
-    loss_adv = -score_fake.mean()
+    loss_adv = F.relu(1.0 - score_fake).mean()
     mse = (x_fake - x_real) ** 2
-    masked_mse = mse * mask
-    loss_rec = masked_mse.sum() / mask.sum().clamp(min=1.0)
+    loss_rec = mse.sum() 
     g_loss = lambda_rec * loss_rec + lambda_adv * loss_adv
 
     return g_loss, {
@@ -146,6 +145,8 @@ def train_epoch(encoder, decoder, discriminator, dataloader, opt_g, opt_d,
         if iter_idx % args.print_every == 0:
             print(f"  Iter [{iter_idx:3d}/{dataloader.num_batch:3d}] "
                   f"D: {metrics['d_loss']:.4f} "
+                  f"D_real: {metrics['d_loss_real']:.4f} "
+                  f"D_fake: {metrics['d_loss_fake']:.4f} "
                   f"G: {metrics['g_loss']:.4f} "
                   f"Rec: {metrics['g_loss_rec']:.6f}")
 
@@ -184,8 +185,7 @@ def validate(encoder, decoder, dataloader, args):
             x_fake = decoder(h)
 
             mse = (x_fake - x_full) ** 2
-            masked_mse = mse * mask
-            loss_rec = masked_mse.sum() / mask.sum().clamp(min=1.0)
+            loss_rec = mse.sum()
             val_rec_losses.append(loss_rec.item())
 
     return {'val_rec_loss': np.mean(val_rec_losses)}
@@ -249,6 +249,8 @@ def train_loop(encoder, decoder, discriminator, train_loader, val_loader, args):
 
         print(f"\n[Epoch {epoch} Summary]")
         print(f"  Train D_loss: {train_metrics['d_loss']:.6f}")
+        print(f"D_real: {train_metrics['d_loss_real']:.6f}")
+        print(f"D_fake: {train_metrics['d_loss_fake']:.6f}")
         print(f"  Train G_loss: {train_metrics['g_loss']:.6f}")
         print(f"  Train Rec_loss: {train_metrics['g_loss_rec']:.6f}")
         print(f"  Val Rec_loss: {val_metrics['val_rec_loss']:.6f}")
