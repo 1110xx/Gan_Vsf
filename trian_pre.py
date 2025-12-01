@@ -115,6 +115,8 @@ def train_epoch(encoder, decoder, discriminator, dataloader, opt_g, opt_d,
     d_losses = []
     g_losses = []
     g_rec_losses = []
+    d_real_losses = []  # 新增
+    d_fake_losses = []  # 新增
 
     num_subset = int(args.num_nodes * args.subset_ratio)
 
@@ -141,6 +143,8 @@ def train_epoch(encoder, decoder, discriminator, dataloader, opt_g, opt_d,
         d_losses.append(metrics['d_loss'])
         g_losses.append(metrics['g_loss'])
         g_rec_losses.append(metrics['g_loss_rec'])
+        d_real_losses.append(metrics['d_loss_real'])  # 新增
+        d_fake_losses.append(metrics['d_loss_fake'])  # 新增
 
         if iter_idx % args.print_every == 0:
             print(f"  Iter [{iter_idx:3d}/{dataloader.num_batch:3d}] "
@@ -156,6 +160,8 @@ def train_epoch(encoder, decoder, discriminator, dataloader, opt_g, opt_d,
         'd_loss': np.mean(d_losses),
         'g_loss': np.mean(g_losses),
         'g_loss_rec': np.mean(g_rec_losses),
+        'd_loss_real': np.mean(d_real_losses),  # 新增
+        'd_loss_fake': np.mean(d_fake_losses),  # 新增
         'epoch_time': epoch_time,
     }
 
