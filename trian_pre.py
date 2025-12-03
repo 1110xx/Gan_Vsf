@@ -20,7 +20,7 @@ from model.discriminator_v2 import FullSequenceDiscriminator
 
 
 def compute_discriminator_loss(score_real, score_fake):
-    # LSGAN判别器损失
+    # LSGAN判别器损失（未带正则的基础版本，当前训练流程未直接使用）
     loss_real = ((score_real - 1) ** 2).mean()
     loss_fake = (score_fake ** 2).mean()
     d_loss = 0.5 * (loss_real + loss_fake)
@@ -32,6 +32,68 @@ def compute_discriminator_loss(score_real, score_fake):
         'score_real': score_real.mean().item(),
         'score_fake': score_fake.mean().item(),
     }
+
+
+def compute_discriminator_loss_with_r1(
+    score_real, score_fake, x_real, discriminator,
+    r1_gamma: float = 10.0, r1_interval: int = 16, global_step: int = 0
+):
+    """带 R1 梯度惩罚的判别器损失函数（LSGAN + R1）
+
+    参数
+    ----
+    score_real : 判别器在真实样本上的输出
+    score_fake : 判别器在生成样本上的输出
+    x_real     : 判别器的真实输入张量，形状 [B, F, N, T]
+    discriminator : 判别器模型，用于重新前向计算 R1 所需梯度
+    r1_gamma   : R1 正则权重系数
+    r1_interval: 每隔多少个 global_step 计算一次 R1（其余步跳过以节省开销）
+    global_step: 全局训练步数，用于控制间隔
+    """
+    # 基础 LSGAN 判别器损失
+    loss_real = ((score_real - 1) ** 2).mean()
+    loss_fake = (score_fake ** 2).mean()
+    d_loss = 0.5 * (loss_real + loss_fake)
+
+    # R1 梯度惩罚（每隔 r1_interval 步计算一次）
+    r1_penalty = None
+    if r1_gamma > 0 and (r1_interval is not None) and (r1_interval > 0) and (global_step % r1_interval == 0):
+        # 使用真实数据的一个可微拷贝，避免影响后续其他计算
+        x_real_r1 = x_real.detach().clone().requires_grad_(True)
+
+        # 重新计算真实样本得分（带梯度）
+        score_real_for_r1 = discriminator(x_real_r1)
+
+        # 梯度张量大小与 x_real_r1 一致
+        grad_outputs = torch.ones_like(score_real_for_r1)
+        gradients = torch.autograd.grad(
+            outputs=score_real_for_r1,
+            inputs=x_real_r1,
+            grad_outputs=grad_outputs,
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True
+        )[0]
+
+        # 计算 R1 范数惩罚 ||∇_x D(x)||^2
+        gradients = gradients.view(gradients.size(0), -1)
+        r1_penalty = (gradients.norm(2, dim=1) ** 2).mean()
+
+        # 添加到总损失： (γ / 2) * E[||∇_x D(x)||^2]
+        d_loss = d_loss + (r1_gamma / 2.0) * r1_penalty
+
+    metrics = {
+        'd_loss': d_loss.item(),
+        'd_loss_real': loss_real.item(),
+        'd_loss_fake': loss_fake.item(),
+        'score_real': score_real.mean().item(),
+        'score_fake': score_fake.mean().item(),
+    }
+
+    if r1_penalty is not None:
+        metrics['r1_penalty'] = r1_penalty.item()
+
+    return d_loss, metrics
 
 
 def compute_generator_loss(score_fake, x_fake, x_real, mask, lambda_rec=1.0, lambda_adv=0.1):
@@ -49,87 +111,87 @@ def compute_generator_loss(score_fake, x_fake, x_real, mask, lambda_rec=1.0, lam
 
 
 def train_step(encoder, decoder, discriminator, x_full, idx_subset,
-              opt_g, opt_d, scaler_g, scaler_d, lambda_rec, lambda_adv, use_amp, device):
-    
-    # ========== D 阶段 ==========
+              opt_g, opt_d, scaler, lambda_rec, lambda_adv,
+              use_amp, device, global_step, args):
+    """整合谱归一化和 R1 梯度惩罚的单步训练过程"""
+
+    B, F, N, T = x_full.shape
+    x_subset = x_full[:, :, idx_subset, :]
+
+    # 可选的掩码（当前损失中未直接使用，但保留以便后续扩展）
+    mask = torch.zeros(B, 1, N, T, device=device)
+    mask[:, :, idx_subset, :] = 1.0
+
+    # ========== 判别器训练 ==========
     discriminator.train()
     encoder.eval()
     decoder.eval()
-    
+
     opt_d.zero_grad()
-    
+
     with autocast(enabled=use_amp):
-        # 选取子集节点对应的输入
-        x_subset = x_full[:, :, idx_subset, :]
         with torch.no_grad():
             h = encoder(x_subset, idx_subset)
             x_fake = decoder(h)
-        
+
         score_real = discriminator(x_full)
         score_fake = discriminator(x_fake.detach())
-        
-        # LSGAN判别器损失
-        loss_real = ((score_real - 1) ** 2).mean()
-        loss_fake = (score_fake ** 2).mean()
-        d_loss = 0.5 * (loss_real + loss_fake)
-    
-    # 记录 D metrics（确保一致性）
-    d_metrics = {
-        'd_loss': d_loss.item(),
-        'd_loss_real': loss_real.item(),
-        'd_loss_fake': loss_fake.item(),
-        'score_real': score_real.mean().item(),
-        'score_fake': score_fake.mean().item(),
-    }
-    
-    # 使用 D 的 scaler
-    scaler_d.scale(d_loss).backward()
-    scaler_d.step(opt_d)
-    scaler_d.update()
-    
-    # ========== G 阶段 ==========
+
+        # 使用带 R1 梯度惩罚的判别器损失
+        d_loss, d_metrics = compute_discriminator_loss_with_r1(
+            score_real, score_fake,
+            x_full, discriminator,
+            r1_gamma=args.r1_gamma,
+            r1_interval=args.r1_interval,
+            global_step=global_step
+        )
+
+    scaler.scale(d_loss).backward()
+    scaler.unscale_(opt_d)
+    torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=args.max_grad_norm_d)
+    scaler.step(opt_d)
+
+    # ========== 生成器训练 ==========
     encoder.train()
     decoder.train()
     discriminator.eval()
-    
+
     opt_g.zero_grad()
-    
+
     with autocast(enabled=use_amp):
         h = encoder(x_subset, idx_subset)
         x_fake = decoder(h)
         score_fake = discriminator(x_fake)
-        
-        # LSGAN生成器损失
-        loss_adv = ((score_fake - 1) ** 2).mean()
+
+        # 生成器损失：LSGAN 形式 + 重构损失
+        loss_adv = ((score_fake - args.target_score_fake) ** 2).mean()
         mse = (x_fake - x_full) ** 2
         loss_rec = mse.mean()
         g_loss = lambda_rec * loss_rec + lambda_adv * loss_adv
-    
-    # 记录 G metrics
+
+    scaler.scale(g_loss).backward()
+    scaler.unscale_(opt_g)
+    torch.nn.utils.clip_grad_norm_(
+        list(encoder.parameters()) + list(decoder.parameters()),
+        max_norm=args.max_grad_norm_g
+    )
+    scaler.step(opt_g)
+    scaler.update()
+
     g_metrics = {
         'g_loss': g_loss.item(),
         'g_loss_adv': loss_adv.item(),
         'g_loss_rec': loss_rec.item(),
     }
-    
-    # 使用 G 的 scaler
-    scaler_g.scale(g_loss).backward()
-    
-    scaler_g.unscale_(opt_g)
-    torch.nn.utils.clip_grad_norm_(
-        list(encoder.parameters()) + list(decoder.parameters()),
-        max_norm=5.0
-    )
-    
-    scaler_g.step(opt_g)
-    scaler_g.update()
-    
+
     metrics = {**d_metrics, **g_metrics}
     return metrics
 
 
 def train_epoch(encoder, decoder, discriminator, dataloader, opt_g, opt_d,
-               scaler_g, scaler_d, args, epoch, lambda_adv):
+               scaler, args, epoch, global_step: int):
+    """更新后的训练周期函数，传递并更新 global_step，并记录 R1 等指标"""
+
     encoder.train()
     decoder.train()
     discriminator.train()
@@ -137,44 +199,69 @@ def train_epoch(encoder, decoder, discriminator, dataloader, opt_g, opt_d,
     d_losses = []
     g_losses = []
     g_rec_losses = []
-    d_real_losses = []  # 新增
-    d_fake_losses = []  # 新增
+    d_real_losses = []
+    d_fake_losses = []
+    r1_penalties = []  # 新增：记录 R1 惩罚
 
     num_subset = int(args.num_nodes * args.subset_ratio)
 
     start_time = time.time()
 
+    perm = None
+    idx_subset = None
+
     for iter_idx, (x, y) in enumerate(dataloader.get_iterator()):
         x_full = torch.Tensor(x).to(args.device)
         x_full = x_full.transpose(1, 3)
 
-        if iter_idx % args.step_size2 == 0:
+        if iter_idx % args.step_size2 == 0 or perm is None or idx_subset is None:
             perm = np.random.permutation(args.num_nodes)
-
-        idx_subset = perm[:num_subset]
-        idx_subset = torch.tensor(idx_subset, device=args.device)
+            idx_subset = torch.tensor(perm[:num_subset], device=args.device)
+        # 否则复用上一轮的 idx_subset
 
         metrics = train_step(
             encoder, decoder, discriminator,
             x_full, idx_subset,
-            opt_g, opt_d, scaler_g, scaler_d,
-            args.lambda_rec, lambda_adv,
-            args.use_amp, args.device
+            opt_g, opt_d, scaler,
+            args.lambda_rec, args.lambda_adv,
+            args.use_amp, args.device,
+            global_step, args  # 传递 global_step
         )
 
         d_losses.append(metrics['d_loss'])
         g_losses.append(metrics['g_loss'])
         g_rec_losses.append(metrics['g_loss_rec'])
-        d_real_losses.append(metrics['d_loss_real'])  # 新增
-        d_fake_losses.append(metrics['d_loss_fake'])  # 新增
+        d_real_losses.append(metrics['d_loss_real'])
+        d_fake_losses.append(metrics['d_loss_fake'])
+
+        # 记录 R1 惩罚（如果存在）
+        if 'r1_penalty' in metrics:
+            r1_penalties.append(metrics['r1_penalty'])
+
+        global_step += 1  # 更新全局步数
 
         if iter_idx % args.print_every == 0:
-            print(f"  Iter [{iter_idx:3d}/{dataloader.num_batch:3d}] "
-                  f"D: {metrics['d_loss']:.4f} "
-                  f"D_real: {metrics['d_loss_real']:.4f} "
-                  f"D_fake: {metrics['d_loss_fake']:.4f} "
-                  f"G: {metrics['g_loss']:.4f} "
-                  f"Rec: {metrics['g_loss_rec']:.6f}")
+            log_str = (
+                f"  Iter [{iter_idx:3d}/{dataloader.num_batch:3d}] "
+                f"D: {metrics['d_loss']:.4f} "
+                f"D_real: {metrics['d_loss_real']:.4f} "
+                f"D_fake: {metrics['d_loss_fake']:.4f} "
+                f"G: {metrics['g_loss']:.4f} "
+                f"Rec: {metrics['g_loss_rec']:.6f}"
+            )
+
+            # 如果计算了 R1 惩罚，则显示
+            if 'r1_penalty' in metrics and metrics['r1_penalty'] > 0:
+                log_str += f" R1: {metrics['r1_penalty']:.6f}"
+
+            # 显示判别器输出范围
+            if 'score_real' in metrics and 'score_fake' in metrics:
+                log_str += (
+                    f"\n     Score_real: {metrics['score_real']:.4f}, "
+                    f"Score_fake: {metrics['score_fake']:.4f}"
+                )
+
+            print(log_str)
 
     epoch_time = time.time() - start_time
 
@@ -182,10 +269,11 @@ def train_epoch(encoder, decoder, discriminator, dataloader, opt_g, opt_d,
         'd_loss': np.mean(d_losses),
         'g_loss': np.mean(g_losses),
         'g_loss_rec': np.mean(g_rec_losses),
-        'd_loss_real': np.mean(d_real_losses),  # 新增
-        'd_loss_fake': np.mean(d_fake_losses),  # 新增
+        'd_loss_real': np.mean(d_real_losses),
+        'd_loss_fake': np.mean(d_fake_losses),
+        'r1_penalty': np.mean(r1_penalties) if r1_penalties else 0.0,
         'epoch_time': epoch_time,
-    }
+    }, global_step
 
 
 def validate(encoder, decoder, dataloader, args):
@@ -222,6 +310,7 @@ def validate(encoder, decoder, dataloader, args):
 def train_loop(encoder, decoder, discriminator, train_loader, val_loader, args):
     os.makedirs(args.save_dir, exist_ok=True)
 
+    # 优化器
     opt_g = torch.optim.Adam(
         list(encoder.parameters()) + list(decoder.parameters()),
         lr=args.lr_g, betas=(0.5, 0.999), weight_decay=args.weight_decay
@@ -238,14 +327,11 @@ def train_loop(encoder, decoder, discriminator, train_loader, val_loader, args):
         'train_g_loss': [],
         'val_rec_loss': [],
         'best_val_loss': float('inf'),
+        'r1_penalty': [],  # 新增：记录 R1 惩罚历史
     }
 
-    # 早停相关参数与计数器
-    patience = getattr(args, "patience", 10)  # 若未在 args 中显式设置，则使用默认值 10
-    patience_counter = 0
-
     print("\n" + "=" * 80)
-    print(" " * 25 + "GAN Pretraining")
+    print(" " * 25 + "GAN Pretraining (with Spectral Norm + R1)")
     print("=" * 80)
     print(f"Dataset: {args.data}")
     print(f"Device: {args.device}")
@@ -257,23 +343,24 @@ def train_loop(encoder, decoder, discriminator, train_loader, val_loader, args):
     print(f"Epochs: {args.num_epochs}")
     print(f"Learning rates: G={args.lr_g}, D={args.lr_d}")
     print(f"Loss weights: λ_rec={args.lambda_rec}, λ_adv={args.lambda_adv}")
-    print(f"Early stopping patience: {patience} epochs")
+    print(f"Spectral Norm: {args.use_spectral_norm}")
+    print(f"R1 Gradient Penalty: gamma={args.r1_gamma}, interval={args.r1_interval}")
     print(f"AMP: {args.use_amp}")
     print(f"\nModel parameters:")
     print(f"  Encoder: {sum(p.numel() for p in encoder.parameters()):,}")
     print(f"  Decoder: {sum(p.numel() for p in decoder.parameters()):,}")
     print(f"  Discriminator: {sum(p.numel() for p in discriminator.parameters()):,}")
     print("=" * 80 + "\n")
-    scaler_g = GradScaler(enabled=args.use_amp)
-    scaler_d = GradScaler(enabled=args.use_amp)
+
+    global_step = 0  # 初始化全局步数
+
     for epoch in range(1, args.num_epochs + 1):
         print(f"\nEpoch {epoch}/{args.num_epochs}")
         print("-" * 80)
-        # 动态调整对抗权重
-        current_lambda_adv = min(0.8, 0.1 + (epoch / args.num_epochs) * 0.7)
-        train_metrics = train_epoch(
+
+        train_metrics, global_step = train_epoch(
             encoder, decoder, discriminator, train_loader,
-            opt_g, opt_d, scaler_g, scaler_d,  args, epoch, lambda_adv=current_lambda_adv 
+            opt_g, opt_d, scaler, args, epoch, global_step
         )
 
         val_metrics = validate(encoder, decoder, val_loader, args)
@@ -281,35 +368,38 @@ def train_loop(encoder, decoder, discriminator, train_loader, val_loader, args):
         history['train_d_loss'].append(train_metrics['d_loss'])
         history['train_g_loss'].append(train_metrics['g_loss'])
         history['val_rec_loss'].append(val_metrics['val_rec_loss'])
+        history['r1_penalty'].append(train_metrics['r1_penalty'])
 
         print(f"\n[Epoch {epoch} Summary]")
         print(f"  Train D_loss: {train_metrics['d_loss']:.6f}")
-        print(f"D_real: {train_metrics['d_loss_real']:.6f}")
-        print(f"D_fake: {train_metrics['d_loss_fake']:.6f}")
+        print(f"  D_real: {train_metrics['d_loss_real']:.6f}")
+        print(f"  D_fake: {train_metrics['d_loss_fake']:.6f}")
+
+        if train_metrics['r1_penalty'] > 0:
+            print(f"  R1 Penalty: {train_metrics['r1_penalty']:.6f}")
+
         print(f"  Train G_loss: {train_metrics['g_loss']:.6f}")
         print(f"  Train Rec_loss: {train_metrics['g_loss_rec']:.6f}")
         print(f"  Val Rec_loss: {val_metrics['val_rec_loss']:.6f}")
         print(f"  Time: {train_metrics['epoch_time']:.2f}s")
+        print(f"  Global Step: {global_step}")
 
-        # 早停机制：根据验证集重构损失跟踪最佳模型
+        # 保存最佳模型
         if val_metrics['val_rec_loss'] < history['best_val_loss']:
             history['best_val_loss'] = val_metrics['val_rec_loss']
-            patience_counter = 0  # 有提升，重置计数器
-
             best_path = os.path.join(args.save_dir, 'best_model.pt')
             torch.save({
                 'epoch': epoch,
                 'encoder_state_dict': encoder.state_dict(),
                 'decoder_state_dict': decoder.state_dict(),
+                'discriminator_state_dict': discriminator.state_dict(),
                 'val_rec_loss': history['best_val_loss'],
+                'global_step': global_step,
                 'args': vars(args),
             }, best_path)
             print(f"  → Best model saved! Val loss: {history['best_val_loss']:.6f}")
-        else:
-            # 没有提升，耐心计数 +1
-            patience_counter += 1
-            print(f"  → No improvement in val loss. Patience {patience_counter}/{patience}")
 
+        # 定期保存检查点
         if epoch % args.save_interval == 0:
             ckpt_path = os.path.join(args.save_dir, f'checkpoint_epoch_{epoch}.pt')
             torch.save({
@@ -320,20 +410,16 @@ def train_loop(encoder, decoder, discriminator, train_loader, val_loader, args):
                 'opt_g_state_dict': opt_g.state_dict(),
                 'opt_d_state_dict': opt_d.state_dict(),
                 'history': history,
+                'global_step': global_step,
                 'args': vars(args),
             }, ckpt_path)
             print(f"  → Checkpoint saved: {ckpt_path}")
-
-        # 若连续 patience 轮没有提升，则提前停止训练
-        if patience_counter >= patience:
-            print(f"\nEarly stopping triggered at epoch {epoch}.")
-            print(f"Best validation loss: {history['best_val_loss']:.6f}")
-            break
 
     print("\n" + "=" * 80)
     print(" " * 25 + "Training Completed!")
     print("=" * 80)
     print(f"Best validation loss: {history['best_val_loss']:.6f}")
+    print(f"Final global step: {global_step}")
 
 
 def str_to_bool(value):
@@ -351,9 +437,9 @@ def main():
     parser = argparse.ArgumentParser(description='通用GAN预训练脚本')
 
     # 数据参数
-    parser.add_argument('--data', type=str, required=True, help='数据路径（如 ./data/ECG5000）')
+    parser.add_argument('--data', type=str, required=True, help='数据路径')
     parser.add_argument('--batch_size', type=int, default=32, help='批次大小')
-    parser.add_argument('--in_dim', type=int, default=None, help='输入特征维度（自动检测）')
+    parser.add_argument('--in_dim', type=int, default=None, help='输入特征维度')
     parser.add_argument('--seq_in_len', type=int, default=12, help='输入序列长度')
     parser.add_argument('--seq_out_len', type=int, default=12, help='输出序列长度')
 
@@ -365,19 +451,37 @@ def main():
 
     # 训练参数
     parser.add_argument('--num_epochs', type=int, default=100, help='训练轮数')
-    parser.add_argument('--lr_g', type=float, default=2e-4)  # 提高生成器
-    parser.add_argument('--lr_d', type=float, default=1e-4)  # 降低判别器
+    parser.add_argument('--lr_g', type=float, default=2e-4, help='生成器学习率')
+    parser.add_argument('--lr_d', type=float, default=1e-4, help='判别器学习率')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='权重衰减')
 
     # 损失权重
-    parser.add_argument('--lambda_rec', type=float, default=1.0, help='重构损失权重')
-    parser.add_argument('--lambda_adv', type=float, default=0.5, help='对抗损失权重')
+    parser.add_argument('--lambda_rec', type=float, default=0.8, help='重构损失权重')
+    parser.add_argument('--lambda_adv', type=float, default=1.2, help='对抗损失权重')
 
     # 子集配置
-    parser.add_argument('--subset_ratio', type=float, default=0.3, help='子集比例')
+    parser.add_argument('--subset_ratio', type=float, default=0.5, help='子集比例')
     parser.add_argument('--step_size2', type=int, default=100, help='子集变化步长')
 
-    # load_dataset需要的参数（参考main.py）
+    # 谱归一化和 R1 梯度惩罚参数
+    parser.add_argument('--use_spectral_norm', type=str_to_bool, default=True,
+                       help='是否使用谱归一化')
+    parser.add_argument('--disc_dropout', type=float, default=0.1,
+                       help='判别器 dropout 率')
+    parser.add_argument('--r1_gamma', type=float, default=10.0,
+                       help='R1 梯度惩罚系数')
+    parser.add_argument('--r1_interval', type=int, default=16,
+                       help='R1 惩罚计算间隔（每 n 步计算一次）')
+    parser.add_argument('--target_score_fake', type=float, default=0.7,
+                       help='生成器对抗损失的目标分数')
+
+    # 梯度截断参数
+    parser.add_argument('--max_grad_norm_g', type=float, default=2.0,
+                       help='生成器梯度最大范数')
+    parser.add_argument('--max_grad_norm_d', type=float, default=1.0,
+                       help='判别器梯度最大范数')
+
+    # load_dataset 需要的参数
     parser.add_argument('--predefined_S', type=str_to_bool, default=False, help='是否使用预定义子集S')
     parser.add_argument('--predefined_S_frac', type=int, default=15, help='预定义子集S的比例')
 
@@ -386,16 +490,17 @@ def main():
     parser.add_argument('--seed', type=int, default=2024, help='随机种子')
     parser.add_argument('--save_dir', type=str, default='./checkpoints_pretrain', help='保存目录')
     parser.add_argument('--save_interval', type=int, default=10, help='保存间隔')
-    parser.add_argument('--patience', type=int, default=10, help='早停耐心轮数（验证集无提升的最大连续轮数）')
     parser.add_argument('--print_every', type=int, default=50, help='打印间隔')
 
     args = parser.parse_args()
 
+    # 设置随机种子
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
+    # 设备设置
     if args.device == 'cuda' and not torch.cuda.is_available():
         print("Warning: CUDA not available, using CPU")
         args.device = 'cpu'
@@ -403,12 +508,13 @@ def main():
     args.use_amp = (args.device == 'cuda')
     device = torch.device(args.device)
 
+    # 加载数据
     print(f"Loading data from {args.data}...")
     dataloader_dict = load_dataset(args, args.data, args.batch_size, args.batch_size, args.batch_size)
 
     train_loader = dataloader_dict['train_loader']
     val_loader = dataloader_dict['val_loader']
-    scaler = dataloader_dict['scaler']
+    scaler_data = dataloader_dict['scaler']  # 避免与 GradScaler 命名冲突
 
     args.num_nodes = train_loader.num_nodes
 
@@ -423,6 +529,7 @@ def main():
     print(f"  Val samples: {val_loader.size}")
     print(f"  Subset nodes: {int(args.num_nodes * args.subset_ratio)}")
 
+    # 创建模型
     print(f"\nCreating models...")
 
     encoder = TimeFirstEncoder(
@@ -439,13 +546,19 @@ def main():
         out_dim=args.in_dim
     ).to(device)
 
+    # 使用新版判别器（带谱归一化和 Dropout）
     discriminator = FullSequenceDiscriminator(
         in_dim=args.in_dim,
-        hidden_dim=args.hidden_dim
+        hidden_dim=args.hidden_dim,
+        use_spectral_norm=args.use_spectral_norm,
+        dropout=args.disc_dropout
     ).to(device)
 
     print(f"✓ Models created")
+    print(f"  Discriminator using spectral norm: {args.use_spectral_norm}")
+    print(f"  R1 gradient penalty: gamma={args.r1_gamma}, interval={args.r1_interval}")
 
+    # 训练循环
     train_loop(encoder, decoder, discriminator, train_loader, val_loader, args)
 
 
