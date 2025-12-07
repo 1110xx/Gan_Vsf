@@ -10,7 +10,8 @@ from typing import Dict, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
+# 暂时注释掉AMP，先保证运行
+# from torch.cuda.amp import autocast, GradScaler
 
 from util import load_dataset, StandardScaler
 
@@ -20,21 +21,21 @@ from model.discriminator_v2 import HybridNodeDiscriminator, create_discriminator
 
 
 def compute_hybrid_discriminator_loss(
-    cond_score_real, cond_score_fake,
-    internal_score_real, internal_score_fake,
-    alpha=0.7
+        cond_score_real, cond_score_fake,
+        internal_score_real, internal_score_fake,
+        alpha=0.7
 ):
     """混合判别器损失计算"""
     cond_loss = (
-        F.binary_cross_entropy_with_logits(cond_score_real, torch.ones_like(cond_score_real) * 0.9) +
-        F.binary_cross_entropy_with_logits(cond_score_fake, torch.zeros_like(cond_score_fake))
+            F.binary_cross_entropy_with_logits(cond_score_real, torch.ones_like(cond_score_real) * 0.9) +
+            F.binary_cross_entropy_with_logits(cond_score_fake, torch.zeros_like(cond_score_fake))
     )
     internal_loss = (
-        F.binary_cross_entropy_with_logits(internal_score_real, torch.ones_like(internal_score_real) * 0.9) +
-        F.binary_cross_entropy_with_logits(internal_score_fake, torch.zeros_like(internal_score_fake))
+            F.binary_cross_entropy_with_logits(internal_score_real, torch.ones_like(internal_score_real) * 0.9) +
+            F.binary_cross_entropy_with_logits(internal_score_fake, torch.zeros_like(internal_score_fake))
     )
     d_loss = alpha * cond_loss + (1 - alpha) * internal_loss
-    
+
     return d_loss, {
         'd_loss': d_loss.item(),
         'd_loss_cond': cond_loss.item(),
@@ -47,21 +48,21 @@ def compute_hybrid_discriminator_loss(
 
 
 def compute_hybrid_generator_loss(
-    cond_score_fake, internal_score_fake,
-    x_fake, x_real, lambda_rec=1.0, lambda_adv=0.1, alpha=0.7
+        cond_score_fake, internal_score_fake,
+        x_missing_fake, x_missing_real, lambda_rec=1.0, lambda_adv=0.1, alpha=0.7
 ):
     """混合判别器的生成器损失"""
     # 对抗损失（混合）
     cond_loss = F.binary_cross_entropy_with_logits(cond_score_fake, torch.ones_like(cond_score_fake))
     internal_loss = F.binary_cross_entropy_with_logits(internal_score_fake, torch.ones_like(internal_score_fake))
     loss_adv = alpha * cond_loss + (1 - alpha) * internal_loss
-    
+
     # 重构损失
-    mse = (x_fake - x_real) ** 2
+    mse = (x_missing_fake - x_missing_real) ** 2
     loss_rec = mse.mean()
-    
+
     g_loss = lambda_rec * loss_rec + lambda_adv * loss_adv
-    
+
     return g_loss, {
         'g_loss': g_loss.item(),
         'g_loss_adv': loss_adv.item(),
@@ -71,96 +72,95 @@ def compute_hybrid_generator_loss(
     }
 
 
-def train_step(encoder, decoder, discriminator, x_full, idx_subset,
-              opt_g, opt_d, scaler, lambda_rec, lambda_adv, 
-              use_amp, device, args):
-    """混合判别器的训练步骤"""
-    
+def train_step_simple(encoder, decoder, discriminator, x_full, idx_subset,
+                      opt_g, opt_d, lambda_rec, lambda_adv, device, args):
+    """简化版本：不使用AMP，先确保运行正常"""
+
     B, F, N, T = x_full.shape
-    
+
     # 创建掩码来分离子集节点和缺失节点
     subset_mask = torch.zeros(N, dtype=torch.bool, device=device)
     subset_mask[idx_subset] = True
-    
+
     missing_mask = ~subset_mask
     missing_indices = torch.where(missing_mask)[0]
-    
+
     # 提取真实数据的子集和缺失部分
     x_subset_real = x_full[:, :, idx_subset, :]
     x_missing_real = x_full[:, :, missing_indices, :]
-    
+
     # ========== 判别器训练 ==========
     discriminator.train()
     encoder.eval()
     decoder.eval()
-    
+
     opt_d.zero_grad()
-    
-    with autocast(enabled=use_amp):
-        with torch.no_grad():
-            h = encoder(x_subset_real, idx_subset)
-            x_fake = decoder(h)
-        
-        # 提取生成数据的缺失部分
-        x_missing_fake = x_fake[:, :, missing_indices, :]
-        
-        # 判别器前向传播（真实数据）
-        cond_score_real, internal_score_real = discriminator(x_subset_real, x_missing_real)
-        
-        # 判别器前向传播（生成数据）
-        cond_score_fake, internal_score_fake = discriminator(x_subset_real, x_missing_fake.detach())
-        
-        # 计算判别器损失
-        d_loss, d_metrics = compute_hybrid_discriminator_loss(
-            cond_score_real, cond_score_fake,
-            internal_score_real, internal_score_fake,
-            alpha=args.disc_alpha
-        )
-    
-    scaler.scale(d_loss).backward()
-    scaler.unscale_(opt_d)
+
+    # 生成假数据
+    with torch.no_grad():
+        h = encoder(x_subset_real, idx_subset)
+        x_fake = decoder(h)
+
+    # 提取生成数据的缺失部分
+    x_missing_fake = x_fake[:, :, missing_indices, :]
+
+    # 判别器前向传播
+    cond_score_real, internal_score_real = discriminator(x_subset_real, x_missing_real)
+    cond_score_fake, internal_score_fake = discriminator(x_subset_real, x_missing_fake.detach())
+
+    # 计算判别器损失
+    d_loss, d_metrics = compute_hybrid_discriminator_loss(
+        cond_score_real, cond_score_fake,
+        internal_score_real, internal_score_fake,
+        alpha=args.disc_alpha
+    )
+
+    # 反向传播和优化
+    d_loss.backward()
     torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=args.max_grad_norm_d)
-    scaler.step(opt_d)
-    
+    opt_d.step()
+
     # ========== 生成器训练 ==========
     encoder.train()
     decoder.train()
     discriminator.eval()
-    
+
     opt_g.zero_grad()
-    
-    with autocast(enabled=use_amp):
-        h = encoder(x_subset_real, idx_subset)
-        x_fake = decoder(h)
-        x_missing_fake = x_fake[:, :, missing_indices, :]
-        
-        # 生成器前向传播
-        cond_score_fake, internal_score_fake = discriminator(x_subset_real, x_missing_fake)
-        
-        # 计算生成器损失
-        g_loss, g_metrics = compute_hybrid_generator_loss(
-            cond_score_fake, internal_score_fake,
-            x_fake, x_full,
-            lambda_rec, lambda_adv,
-            alpha=args.disc_alpha
-        )
-    
-    scaler.scale(g_loss).backward()
-    scaler.unscale_(opt_g)
+
+    # 生成器前向传播
+    h = encoder(x_subset_real, idx_subset)
+    x_fake = decoder(h)
+    x_missing_fake = x_fake[:, :, missing_indices, :]
+
+    # 重新获取真实数据（确保维度一致）
+    x_missing_real_current = x_full[:, :, missing_indices, :]
+
+    # 判别器前向传播
+    cond_score_fake, internal_score_fake = discriminator(x_subset_real, x_missing_fake)
+
+    # 计算生成器损失
+    g_loss, g_metrics = compute_hybrid_generator_loss(
+        cond_score_fake, internal_score_fake,
+        x_missing_fake, x_missing_real_current,
+        lambda_rec, lambda_adv,
+        alpha=args.disc_alpha
+    )
+
+    # 反向传播和优化
+    g_loss.backward()
     torch.nn.utils.clip_grad_norm_(
         list(encoder.parameters()) + list(decoder.parameters()),
         max_norm=args.max_grad_norm_g
     )
-    scaler.step(opt_g)
-    scaler.update()
-    
+    opt_g.step()
+
+    # 合并指标
     metrics = {**d_metrics, **g_metrics}
     return metrics
 
 
-def train_epoch_hybrid(encoder, decoder, discriminator, dataloader, opt_g, opt_d,
-                      scaler, args, epoch):
-    """混合判别器的训练epoch"""
+def train_epoch_hybrid_simple(encoder, decoder, discriminator, dataloader, opt_g, opt_d, args, epoch):
+    """简化版本：训练epoch"""
 
     encoder.train()
     decoder.train()
@@ -188,13 +188,12 @@ def train_epoch_hybrid(encoder, decoder, discriminator, dataloader, opt_g, opt_d
             perm = np.random.permutation(args.num_nodes)
             idx_subset = torch.tensor(perm[:num_subset], device=args.device)
 
-        metrics = train_step(
+        metrics = train_step_simple(
             encoder, decoder, discriminator,
             x_full, idx_subset,
-            opt_g, opt_d, scaler,
+            opt_g, opt_d,
             args.lambda_rec, args.lambda_adv,
-            args.use_amp, args.device,
-            args
+            args.device, args
         )
 
         d_losses.append(metrics['d_loss'])
@@ -247,29 +246,34 @@ def validate(encoder, decoder, dataloader, args):
             h = encoder(x_subset, idx_subset)
             x_fake = decoder(h)
 
-            mse = (x_fake - x_full) ** 2
+            missing_mask = torch.ones(args.num_nodes, dtype=torch.bool, device=args.device)
+            missing_mask[idx_subset] = False
+            missing_indices = torch.where(missing_mask)[0]
+            x_missing_real = x_full[:, :, missing_indices, :]
+            x_missing_fake = x_fake[:, :, missing_indices, :]
+            mse = (x_missing_fake - x_missing_real) ** 2
             loss_rec = mse.mean()
             val_rec_losses.append(loss_rec.item())
 
     return {'val_rec_loss': np.mean(val_rec_losses)}
 
 
-def train_loop_hybrid(encoder, decoder, discriminator, train_loader, val_loader, args):
-    """混合判别器的训练循环"""
+def train_loop_hybrid_simple(encoder, decoder, discriminator, train_loader, val_loader, args):
+    """简化版本：训练循环"""
 
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # 优化器
+    # 优化器 - 使用标准Adam
     opt_g = torch.optim.Adam(
         list(encoder.parameters()) + list(decoder.parameters()),
-        lr=args.lr_g, betas=(0.5, 0.999), weight_decay=args.weight_decay
+        lr=args.lr_g, betas=(0.9, 0.999),
+        weight_decay=args.weight_decay
     )
     opt_d = torch.optim.Adam(
         discriminator.parameters(),
-        lr=args.lr_d, betas=(0.5, 0.999), weight_decay=args.weight_decay
+        lr=args.lr_d, betas=(0.9, 0.999),
+        weight_decay=args.weight_decay
     )
-
-    scaler = GradScaler(enabled=args.use_amp)
 
     history = {
         'train_d_loss': [],
@@ -281,7 +285,7 @@ def train_loop_hybrid(encoder, decoder, discriminator, train_loader, val_loader,
     }
 
     print("\n" + "=" * 80)
-    print(" " * 20 + "Hybrid Discriminator GAN Pretraining")
+    print(" " * 20 + "Hybrid Discriminator GAN Pretraining (Simple Version)")
     print("=" * 80)
     print(f"Dataset: {args.data}")
     print(f"Device: {args.device}")
@@ -294,7 +298,7 @@ def train_loop_hybrid(encoder, decoder, discriminator, train_loader, val_loader,
     print(f"Epochs: {args.num_epochs}")
     print(f"Learning rates: G={args.lr_g}, D={args.lr_d}")
     print(f"Loss weights: λ_rec={args.lambda_rec}, λ_adv={args.lambda_adv}")
-    print(f"AMP: {args.use_amp}")
+    print(f"AMP: Disabled (for debugging)")
     print(f"\nModel parameters:")
     print(f"  Encoder: {sum(p.numel() for p in encoder.parameters()):,}")
     print(f"  Decoder: {sum(p.numel() for p in decoder.parameters()):,}")
@@ -306,9 +310,9 @@ def train_loop_hybrid(encoder, decoder, discriminator, train_loader, val_loader,
         print("-" * 80)
 
         # 训练一个epoch
-        train_metrics = train_epoch_hybrid(
+        train_metrics = train_epoch_hybrid_simple(
             encoder, decoder, discriminator, train_loader,
-            opt_g, opt_d, scaler, args, epoch
+            opt_g, opt_d, args, epoch
         )
 
         # 验证
@@ -326,8 +330,10 @@ def train_loop_hybrid(encoder, decoder, discriminator, train_loader, val_loader,
         print(f"  Train D_loss: {train_metrics['d_loss']:.6f}")
         print(f"    - D_cond: {train_metrics['d_loss_cond']:.6f}")
         print(f"    - D_internal: {train_metrics['d_loss_internal']:.6f}")
-        print(f"  Cond scores - real: {train_metrics['cond_score_real']:.4f}, fake: {train_metrics['cond_score_fake']:.4f}")
-        print(f"  Internal scores - real: {train_metrics['internal_score_real']:.4f}, fake: {train_metrics['internal_score_fake']:.4f}")
+        print(
+            f"  Cond scores - real: {train_metrics['cond_score_real']:.4f}, fake: {train_metrics['cond_score_fake']:.4f}")
+        print(
+            f"  Internal scores - real: {train_metrics['internal_score_real']:.4f}, fake: {train_metrics['internal_score_fake']:.4f}")
         print(f"  Train G_loss: {train_metrics['g_loss']:.6f}")
         print(f"  Train Rec_loss: {train_metrics['g_loss_rec']:.6f}")
         print(f"  Val Rec_loss: {val_metrics['val_rec_loss']:.6f}")
@@ -342,6 +348,8 @@ def train_loop_hybrid(encoder, decoder, discriminator, train_loader, val_loader,
                 'encoder_state_dict': encoder.state_dict(),
                 'decoder_state_dict': decoder.state_dict(),
                 'discriminator_state_dict': discriminator.state_dict(),
+                'opt_g_state_dict': opt_g.state_dict(),
+                'opt_d_state_dict': opt_d.state_dict(),
                 'val_rec_loss': history['best_val_loss'],
                 'args': vars(args),
             }, best_path)
@@ -380,7 +388,7 @@ def str_to_bool(value):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='通用GAN预训练脚本')
+    parser = argparse.ArgumentParser(description='简化版本：通用GAN预训练脚本')
 
     # 数据参数
     parser.add_argument('--data', type=str, required=True, help='数据路径')
@@ -396,7 +404,7 @@ def main():
                         help='时序膨胀率列表')
 
     # 训练参数
-    parser.add_argument('--num_epochs', type=int, default=100, help='训练轮数')
+    parser.add_argument('--num_epochs', type=int, default=500, help='训练轮数')
     parser.add_argument('--lr_g', type=float, default=2e-4, help='生成器学习率')
     parser.add_argument('--lr_d', type=float, default=1e-4, help='判别器学习率')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='权重衰减')
@@ -406,18 +414,18 @@ def main():
     parser.add_argument('--lambda_adv', type=float, default=0.1, help='对抗损失权重')
 
     # 子集配置
-    parser.add_argument('--subset_ratio', type=float, default=0.3, help='子集比例')
+    parser.add_argument('--subset_ratio', type=float, default=0.15, help='子集比例')
     parser.add_argument('--step_size2', type=int, default=100, help='子集变化步长')
 
     # 混合判别器参数
     parser.add_argument('--disc_alpha', type=float, default=0.7,
-                       help='条件判别损失的权重（内部判别权重为1-alpha）')
+                        help='条件判别损失的权重（内部判别权重为1-alpha）')
 
     # 梯度截断参数
-    parser.add_argument('--max_grad_norm_g', type=float, default=2.0,
-                       help='生成器梯度最大范数')
-    parser.add_argument('--max_grad_norm_d', type=float, default=1.0,
-                       help='判别器梯度最大范数')
+    parser.add_argument('--max_grad_norm_g', type=float, default=1.0,
+                        help='生成器梯度最大范数')
+    parser.add_argument('--max_grad_norm_d', type=float, default=0.5,
+                        help='判别器梯度最大范数')
 
     # load_dataset 需要的参数
     parser.add_argument('--predefined_S', type=str_to_bool, default=False, help='是否使用预定义子集S')
@@ -426,7 +434,7 @@ def main():
     # 其他
     parser.add_argument('--device', type=str, default='cuda', help='设备')
     parser.add_argument('--seed', type=int, default=2024, help='随机种子')
-    parser.add_argument('--save_dir', type=str, default='./checkpoints_pretrain_hybrid', help='保存目录')
+    parser.add_argument('--save_dir', type=str, default='./checkpoints_pretrain_simple', help='保存目录')
     parser.add_argument('--save_interval', type=int, default=10, help='保存间隔')
     parser.add_argument('--print_every', type=int, default=50, help='打印间隔')
 
@@ -443,7 +451,6 @@ def main():
         print("Warning: CUDA not available, using CPU")
         args.device = 'cpu'
 
-    args.use_amp = (args.device == 'cuda')
     device = torch.device(args.device)
 
     # 加载数据
@@ -452,7 +459,7 @@ def main():
 
     train_loader = dataloader_dict['train_loader']
     val_loader = dataloader_dict['val_loader']
-    scaler_data = dataloader_dict['scaler']  # 避免与 GradScaler 命名冲突
+    scaler_data = dataloader_dict['scaler']
 
     args.num_nodes = train_loader.num_nodes
 
@@ -494,8 +501,8 @@ def main():
     print(f"✓ Models created")
     print(f"  Using Hybrid Discriminator with alpha={args.disc_alpha}")
 
-    # 训练循环（train_loop函数也需要更新，主要是打印信息的变化）
-    train_loop_hybrid(encoder, decoder, discriminator, train_loader, val_loader, args)
+    # 训练循环
+    train_loop_hybrid_simple(encoder, decoder, discriminator, train_loader, val_loader, args)
 
 
 if __name__ == "__main__":
