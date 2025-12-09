@@ -48,7 +48,8 @@ def compute_hybrid_discriminator_loss(
 
 def compute_hybrid_generator_loss(
     cond_score_fake, internal_score_fake,
-    x_fake, x_real, lambda_rec=1.0, lambda_adv=0.1, alpha=0.7
+    x_fake, x_real, missing_indices,
+    lambda_rec=1.0, lambda_adv=0.1, alpha=0.7
 ):
     """混合判别器的生成器损失"""
     # 对抗损失（混合）
@@ -56,8 +57,10 @@ def compute_hybrid_generator_loss(
     internal_loss = F.binary_cross_entropy_with_logits(internal_score_fake, torch.ones_like(internal_score_fake))
     loss_adv = alpha * cond_loss + (1 - alpha) * internal_loss
     
-    # 重构损失
-    mse = (x_fake - x_real) ** 2
+    # 仅缺失节点
+    x_missing_fake = x_fake[:, :,missing_indices,:]
+    x_missing_real = x_real[:, :,missing_indices,:]
+    mse = (x_missing_real - x_missing_fake) ** 2
     loss_rec = mse.mean()
     
     g_loss = lambda_rec * loss_rec + lambda_adv * loss_adv
@@ -68,6 +71,7 @@ def compute_hybrid_generator_loss(
         'g_loss_cond': cond_loss.item(),
         'g_loss_internal': internal_loss.item(),
         'g_loss_rec': loss_rec.item(),
+        'missing_nodes_count': len(missing_indices)
     }
 
 
@@ -140,7 +144,7 @@ def train_step(encoder, decoder, discriminator, x_full, idx_subset,
         # 计算生成器损失
         g_loss, g_metrics = compute_hybrid_generator_loss(
             cond_score_fake, internal_score_fake,
-            x_fake, x_full,
+            x_fake, x_full,missing_indices,
             lambda_rec, lambda_adv,
             alpha=args.disc_alpha
         )
@@ -166,6 +170,8 @@ def train_epoch_hybrid(encoder, decoder, discriminator, dataloader, opt_g, opt_d
     decoder.train()
     discriminator.train()
 
+
+    dataloader.shuffle()
     d_losses = []
     g_losses = []
     g_rec_losses = []
@@ -247,7 +253,14 @@ def validate(encoder, decoder, dataloader, args):
             h = encoder(x_subset, idx_subset)
             x_fake = decoder(h)
 
-            mse = (x_fake - x_full) ** 2
+            subset_mask = torch.zeros(args.num_nodes,dtype=torch.bool,device=args.device)
+            subset_mask[idx_subset] = True
+            missing_indices = torch.where(~subset_mask)[0]
+
+            x_missing_fake = x_fake[:, :,missing_indices,:]
+            x_missing_real = x_full[:, :,missing_indices,:]
+
+            mse = (x_missing_fake - x_missing_real)**2
             loss_rec = mse.mean()
             val_rec_losses.append(loss_rec.item())
 
@@ -406,8 +419,8 @@ def main():
     parser.add_argument('--lambda_adv', type=float, default=0.1, help='对抗损失权重')
 
     # 子集配置
-    parser.add_argument('--subset_ratio', type=float, default=0.3, help='子集比例')
-    parser.add_argument('--step_size2', type=int, default=100, help='子集变化步长')
+    parser.add_argument('--subset_ratio', type=float, default=0.15, help='子集比例')
+    parser.add_argument('--step_size2', type=int, default=50, help='子集变化步长')
 
     # 混合判别器参数
     parser.add_argument('--disc_alpha', type=float, default=0.7,
@@ -429,7 +442,7 @@ def main():
     parser.add_argument('--save_dir', type=str, default='./checkpoints_pretrain_hybrid', help='保存目录')
     parser.add_argument('--save_interval', type=int, default=10, help='保存间隔')
     parser.add_argument('--print_every', type=int, default=50, help='打印间隔')
-
+    parser.add_argument('--resume_ckpt', type=str, default='None', help='已有模型继续训练')
     args = parser.parse_args()
 
     # 设置随机种子
@@ -443,7 +456,8 @@ def main():
         print("Warning: CUDA not available, using CPU")
         args.device = 'cpu'
 
-    args.use_amp = (args.device == 'cuda')
+    # args.use_amp = (args.device == 'cuda')
+    args.use_amp = False
     device = torch.device(args.device)
 
     # 加载数据
@@ -491,6 +505,14 @@ def main():
         hidden_dim=args.hidden_dim
     ).to(device)
 
+    if args.resume_ckpt is not None and os.path.isfile(args.resume_ckpt):
+        ckpt = torch.load(args.resume_ckpt, map_location=device)
+        encoder.load_state_dict(ckpt['encoder_state_dict'])
+        decoder.load_state_dict(ckpt['decoder_state_dict'])
+        discriminator.load_state_dict(ckpt['discriminator_state_dict'])
+        print(f"Loaded checkpoint from {args.resume_ckpt}")
+    elif args.resume_ckpt is not None:
+        print(f"Warning: checkpoint not found at {args.resume_ckpt}")
     print(f"✓ Models created")
     print(f"  Using Hybrid Discriminator with alpha={args.disc_alpha}")
 
