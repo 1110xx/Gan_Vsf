@@ -1,19 +1,23 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils import spectral_norm
 
 
 class NodeTemporalEncoder(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int):
+    def __init__(self, input_dim: int, hidden_dim: int, use_spectral_norm: bool = True ):
         super().__init__()
+
+        norm_fn = spectral_norm if use_spectral_norm else lambda x: x
+
         self.temporal_conv = nn.Sequential(
-            nn.Conv2d(input_dim, hidden_dim, kernel_size=(1, 3), padding=(0, 1)),
+            norm_fn(nn.Conv2d(input_dim, hidden_dim, kernel_size=(1, 3), padding=(0, 1))),
             nn.LeakyReLU(0.2),
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=(1, 3), padding=(0, 2), dilation=(1, 2)),
+            norm_fn(nn.Conv2d(hidden_dim, hidden_dim, kernel_size=(1, 3), padding=(0, 2), dilation=(1, 2))),
             nn.LeakyReLU(0.2)
         )
         self.node_pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(hidden_dim, hidden_dim)
+        self.fc = norm_fn(nn.Linear(hidden_dim, hidden_dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x:(B, F, N, T) -> (B, H)"""
@@ -25,22 +29,25 @@ class NodeTemporalEncoder(nn.Module):
 
 
 class HybridNodeDiscriminator(nn.Module):
-    def __init__(self, feature_dim: int, hidden_dim: int = 64):
+    def __init__(self, feature_dim: int, hidden_dim: int = 64,use_spectral_norm: bool = True):
         super().__init__()
 
-        self.sub_encoder = NodeTemporalEncoder(feature_dim, hidden_dim)
-        self.miss_encoder = NodeTemporalEncoder(feature_dim, hidden_dim)
+        self.use_spectral_norm = use_spectral_norm
+        norm_fn = spectral_norm if use_spectral_norm else lambda x: x
+        
+        self.sub_encoder = NodeTemporalEncoder(feature_dim, hidden_dim, use_spectral_norm)
+        self.miss_encoder = NodeTemporalEncoder(feature_dim, hidden_dim, use_spectral_norm)
         self.cond_head = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
+            norm_fn(nn.Linear(hidden_dim * 2, hidden_dim)),
             nn.LeakyReLU(0.2),
-            nn.Linear(hidden_dim, 1)
+            norm_fn(nn.Linear(hidden_dim, 1))
         )
 
-        self.internal_encoder = NodeTemporalEncoder(feature_dim, hidden_dim)
+        self.internal_encoder = NodeTemporalEncoder(feature_dim, hidden_dim, use_spectral_norm)
         self.internal_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            norm_fn(nn.Linear(hidden_dim, hidden_dim // 2)),
             nn.LeakyReLU(0.2),
-            nn.Linear(hidden_dim // 2, 1)
+            norm_fn(nn.Linear(hidden_dim // 2, 1))
         )
 
     def forward(self, subset_nodes: torch.Tensor, missing_nodes: torch.Tensor):
@@ -82,7 +89,8 @@ def compute_hybrid_g_loss(cond_fake, internal_fake, alpha=0.7):
 
 def create_discriminator(
         feature_dim: int,
-        hidden_dim: int = 64
+        hidden_dim: int = 64,
+        use_spectral_norm: bool = True 
 ) -> HybridNodeDiscriminator:
     """创建混合判别器的工厂函数"""
-    return HybridNodeDiscriminator(feature_dim=feature_dim, hidden_dim=hidden_dim)
+    return HybridNodeDiscriminator(feature_dim=feature_dim, hidden_dim=hidden_dim, use_spectral_norm=use_spectral_norm)

@@ -345,7 +345,12 @@ def train_loop_hybrid(encoder, decoder, discriminator, train_loader, val_loader,
         print(f"  Train Rec_loss: {train_metrics['g_loss_rec']:.6f}")
         print(f"  Val Rec_loss: {val_metrics['val_rec_loss']:.6f}")
         print(f"  Time: {train_metrics['epoch_time']:.2f}s")
-
+        # w_init
+        w_sp = torch.sigmoid(encoder.lambda_sp).item()
+        w_init = torch.sigmoid(encoder.lambda_init).item()
+        w_sum = w_sp + w_init  # 确保 w_sum 被定义
+        print(f"[Encoder weight] Lambda_sp={encoder.lambda_sp.item():.4f}, Lambda_init={encoder.lambda_init.item():.4f}")
+        print(f"                 w_sp={w_sp:.4f}, w_init={w_init:.4f} -> normalized: w_sp={w_sp/w_sum:.4f}, w_init={w_init/w_sum:.4f}")
         # 保存最佳模型
         if val_metrics['val_rec_loss'] < history['best_val_loss']:
             history['best_val_loss'] = val_metrics['val_rec_loss']
@@ -490,6 +495,7 @@ def main():
         in_dim=args.in_dim,
         hidden_dim=args.hidden_dim,
         num_prototypes=args.num_prototypes,
+        seq_len=args.seq_in_len,
         temporal_dilations=args.temporal_dilations,
         device=args.device
     ).to(device)

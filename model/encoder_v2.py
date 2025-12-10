@@ -204,6 +204,7 @@ class TimeFirstEncoder(nn.Module):
         in_dim: int,
         hidden_dim: int,
         num_prototypes: int = 32,
+        seq_len: int = 12,
         temporal_dilations: List[int] = [1, 2, 4, 8, 16, 32],
         kernel_size: int = 3,
         use_projection: bool = False,
@@ -218,6 +219,7 @@ class TimeFirstEncoder(nn.Module):
         self.in_dim = in_dim
         self.hidden_dim = hidden_dim
         self.num_prototypes = num_prototypes
+        self.seq_len = seq_len
         self.device = device
 
         self.pretrain_temporal_epochs = pretrain_temporal_epochs
@@ -234,6 +236,8 @@ class TimeFirstEncoder(nn.Module):
         self.prototype_routing = PrototypeRoutingModule(
             D=hidden_dim,
             K=num_prototypes,
+            num_nodes=num_nodes,
+            seq_len=seq_len,
             summary_pool=summary_pool,
             use_projection=use_projection
         )
