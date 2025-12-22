@@ -3,12 +3,12 @@ True`. This limits the functions that could be executed during unpickling. Arbit
 /home/yxtang/anaconda3/envs/Gan_VSF_py39/lib/python3.9/site-packages/torch/optim/lr_scheduler.py:62: UserWarning: The verbose parameter is deprecated. Please use get_last_lr() to access the learning rate.
   warnings.warn(
 Traceback (most recent call last):
-  File "/home/yxtang/Gan_VSF/trian_perd.py", line 434, in <module>
+  File "/home/yxtang/Gan_VSF/trian_perd.py", line 451, in <module>
     main()
-  File "/home/yxtang/Gan_VSF/trian_perd.py", line 430, in main
+  File "/home/yxtang/Gan_VSF/trian_perd.py", line 447, in main
     train_loop(encoder, pred_head, decoder, train_loader, val_loader, args, scaler)
-  File "/home/yxtang/Gan_VSF/trian_perd.py", line 239, in train_loop
+  File "/home/yxtang/Gan_VSF/trian_perd.py", line 256, in train_loop
     train_metrics = train_epoch(
-  File "/home/yxtang/Gan_VSF/trian_perd.py", line 65, in train_epoch
-    y_full =(y_full-scaler.mean)/scaler.std
-AttributeError: 'dict' object has no attribute 'mean'
+  File "/home/yxtang/Gan_VSF/trian_perd.py", line 66, in train_epoch
+    s_mean =scaler.mean if hasattr(scaler, 'mean') else scaler['mean']
+KeyError: 'mean'
