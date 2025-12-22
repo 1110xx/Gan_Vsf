@@ -211,6 +211,7 @@ class TimeFirstEncoder(nn.Module):
         summary_pool: str = 'mean',
         pretrain_temporal_epochs: int = 0,
         use_spatial_module_in_pretrain: bool = False,
+        node_emb_droput: float= 0.5,
         device: str = 'cuda'
     ):
         super().__init__()
@@ -239,7 +240,8 @@ class TimeFirstEncoder(nn.Module):
             num_nodes=num_nodes,
             seq_len=seq_len,
             summary_pool=summary_pool,
-            use_projection=use_projection
+            use_projection=use_projection,
+            node_emb_dropout=node_emb_droput
         )
 
         self.lambda_sp = nn.Parameter(torch.zeros(1))
@@ -275,16 +277,17 @@ class TimeFirstEncoder(nn.Module):
 
         mask_bool = (mask > 0.5).float()
 
-        w_sp = torch.sigmoid(self.lambda_sp)
-        w_init = torch.sigmoid(self.lambda_init)
+        # w_sp = torch.sigmoid(self.lambda_sp)
+        # w_init = torch.sigmoid(self.lambda_init)
 
-        w_sum = w_sp + w_init
-        w_sp = w_sp / (w_sum + 1e-8)
-        w_init = w_init / (w_sum + 1e-8)
+        # w_sum = w_sp + w_init
+        # w_sp = w_sp / (w_sum + 1e-8)
+        # w_init = w_init / (w_sum + 1e-8)
 
-        init = self.unobserved_init.expand(B, self.hidden_dim, self.num_nodes, T)
+        # init = self.unobserved_init.expand(B, self.hidden_dim, self.num_nodes, T)
 
-        h = mask_bool * h_time + (1 - mask_bool) * (w_sp * h_spatial + w_init * init)
+        # h = mask_bool * h_time + (1 - mask_bool) * (w_sp * h_spatial + w_init * init)
+        h = mask_bool * h_time + (1 - mask_bool)* h_spatial 
 
         return h
 

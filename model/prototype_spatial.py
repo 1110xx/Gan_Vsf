@@ -16,7 +16,8 @@ class PrototypeRoutingModule(nn.Module):
         use_projection: bool = False,
         proj_dim: Optional[int] = None,
         use_ema: bool = True,
-        ema_momentum: float = 0.99
+        ema_momentum: float = 0.99,
+        node_emb_dropout: float = 0.5
     ):
         super().__init__()
         self.D = D
@@ -28,6 +29,7 @@ class PrototypeRoutingModule(nn.Module):
         self.proj_dim = proj_dim if proj_dim is not None else D
         self.use_ema = use_ema
         self.ema_momentum =ema_momentum
+        self.node_emb_dropout_rate = node_emb_dropout
 
         self.prototypes = nn.Parameter(torch.randn(K, D))
         nn.init.orthogonal_(self.prototypes)
@@ -43,6 +45,7 @@ class PrototypeRoutingModule(nn.Module):
         self.node_embedding = nn.Embedding(num_nodes, D)
         nn.init.normal_(self.node_embedding.weight, mean=0, std=0.02)
 
+        self.node_emb_dropout = nn.Dropout(p=node_emb_dropout)
 
         self.node_to_prototype = nn.Sequential(
             nn.Linear(D, D),
@@ -178,7 +181,8 @@ class PrototypeRoutingModule(nn.Module):
         H_prototypes: torch.Tensor,
         mask: torch.Tensor,
         idx_obs: torch.Tensor,
-        obs_context: torch.Tensor = None
+        obs_context: torch.Tensor = None,
+        obs_ratio: float = 0.15
     ) -> torch.Tensor:
         B, D, N, T = h_time.shape
         K = H_prototypes.shape[1]
@@ -193,11 +197,14 @@ class PrototypeRoutingModule(nn.Module):
 
         if len(idx_unobs) > 0:
             node_emb_unobs = self.node_embedding(idx_unobs)
+            if self.training:
+                node_emb_unobs = self.node_emb_dropout(node_emb_unobs)
             if obs_context is not None:
                 # obs_context: (B, D) - 观测节点的全局表示
                 # 扩展到 N_unobs 维度并融合
                 obs_context_exp = obs_context.unsqueeze(1).expand(-1, len(idx_unobs), -1)  # (B, N_unobs, D)
                 node_emb_unobs_exp = node_emb_unobs.unsqueeze(0).expand(B, -1, -1)  # (B, N_unobs, D)
+                context_weight = 0.1+0.8*obs_ratio
 
                 # 融合节点身份和观测上下文（加权求和）
                 context_weight = 0.5  # 观测上下文的权重
@@ -243,6 +250,8 @@ class PrototypeRoutingModule(nn.Module):
             idx_obs = torch.tensor(idx_obs, device=h_time.device)
         elif not isinstance(idx_obs, torch.Tensor):
             idx_obs = torch.from_numpy(idx_obs).to(h_time.device)
+        
+        obs_ratio = len(idx_obs)/N
 
         H_prototypes_global = self.get_global_prototype_temporal(B, T)
         s_obs = self.compute_summary(h_time, mask, idx_obs)
@@ -257,12 +266,11 @@ class PrototypeRoutingModule(nn.Module):
 
         
         obs_context = s_obs.mean(dim=1)
-        obs_ratio = len(idx_obs) / N
-        local_weight = 0.3 + 0.4 * obs_ratio
+        local_weight = 0.1 + 0.8 * obs_ratio
         global_weight = 1 - local_weight
         H_prototypes_mixd = global_weight * H_prototypes_global +local_weight * H_prototypes_local
         h_spatial = self.impute_unobserved(
-            h_time, H_prototypes_mixd, mask, idx_obs, obs_context
+            h_time, H_prototypes_mixd, mask, idx_obs, obs_context,obs_ratio
         )
         return h_spatial
 
