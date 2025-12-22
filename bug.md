@@ -1,32 +1,14 @@
- ================================================================================
-                    联合训练: Encoder + TemporalPredHead
-================================================================================
-Dataset: ./data/ECG5000
-Device: cuda
-Num nodes: 140
-Subset ratio: 0.3
-Hidden dim: 64
-Batch size: 32
-Epochs: 100
-Learning rate: 0.0001
-Loss weights: λ_pred=1.0, λ_recon=0.1
-Pred warmup epochs: 10
-
-Model parameters:
-  Encoder: 114,113
-  Pred Head: 32,285
-  Decoder: 705
-==================================
- File "/home/yxtang/anaconda3/envs/Gan_VSF_py39/lib/python3.9/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-  File "/home/yxtang/anaconda3/envs/Gan_VSF_py39/lib/python3.9/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
-    return forward_call(*args, **kwargs)
-  File "/home/yxtang/Gan_VSF/model/pred_decoder.py", line 58, in forward
-    h = self.time_proj(h)
-  File "/home/yxtang/anaconda3/envs/Gan_VSF_py39/lib/python3.9/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-  File "/home/yxtang/anaconda3/envs/Gan_VSF_py39/lib/python3.9/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
-    return forward_call(*args, **kwargs)
-  File "/home/yxtang/anaconda3/envs/Gan_VSF_py39/lib/python3.9/site-packages/torch/nn/modules/linear.py", line 125, in forward
-    return F.linear(input, self.weight, self.bias)
-RuntimeError: mat1 and mat2 shapes cannot be multiplied (286720x12 and 140x140)
+True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  ckpt = torch.load(args.pretrain_ckpt, map_location=device)
+/home/yxtang/anaconda3/envs/Gan_VSF_py39/lib/python3.9/site-packages/torch/optim/lr_scheduler.py:62: UserWarning: The verbose parameter is deprecated. Please use get_last_lr() to access the learning rate.
+  warnings.warn(
+Traceback (most recent call last):
+  File "/home/yxtang/Gan_VSF/trian_perd.py", line 434, in <module>
+    main()
+  File "/home/yxtang/Gan_VSF/trian_perd.py", line 430, in main
+    train_loop(encoder, pred_head, decoder, train_loader, val_loader, args, scaler)
+  File "/home/yxtang/Gan_VSF/trian_perd.py", line 239, in train_loop
+    train_metrics = train_epoch(
+  File "/home/yxtang/Gan_VSF/trian_perd.py", line 65, in train_epoch
+    y_full =(y_full-scaler.mean)/scaler.std
+AttributeError: 'dict' object has no attribute 'mean'
