@@ -1,76 +1,88 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
 
 
-class STDecoder(nn.Module):
+class NodeTemporalEncoder(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int):
+        super().__init__()
+        self.temporal_conv = nn.Sequential(
+            nn.Conv2d(input_dim, hidden_dim, kernel_size=(1, 3), padding=(0, 1)),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=(1, 3), padding=(0, 2), dilation=(1, 2)),
+            nn.LeakyReLU(0.2)
+        )
+        self.node_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(hidden_dim, hidden_dim)
 
-    def __init__(self, in_dim: int, out_dim: int):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x:(B, F, N, T) -> (B, H)"""
+        x = self.temporal_conv(x)
+        x = self.node_pool(x)
+        x = x.squeeze(-1).squeeze(-1)
+        x = self.fc(x)
+        return x
+
+
+class HybridNodeDiscriminator(nn.Module):
+    def __init__(self, feature_dim: int, hidden_dim: int = 64):
         super().__init__()
 
-        self.in_dim = in_dim
-        self.out_dim = out_dim
-
-        self.conv1 = nn.Conv1d(
-            in_channels=in_dim,
-            out_channels=in_dim,
-            kernel_size=3,
-            dilation=1,
-            padding=1,
-            groups=in_dim,
-            bias=True
+        self.sub_encoder = NodeTemporalEncoder(feature_dim, hidden_dim)
+        self.miss_encoder = NodeTemporalEncoder(feature_dim, hidden_dim)
+        self.cond_head = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim, 1)
         )
 
-        self.conv2 = nn.Conv1d(
-            in_channels=in_dim,
-            out_channels=in_dim,
-            kernel_size=3,
-            dilation=2,
-            padding=2,
-            groups=in_dim,
-            bias=True
+        self.internal_encoder = NodeTemporalEncoder(feature_dim, hidden_dim)
+        self.internal_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim // 2, 1)
         )
 
-        self.norm = nn.LayerNorm(in_dim)
-        self.proj = nn.Linear(in_dim, out_dim)
+    def forward(self, subset_nodes: torch.Tensor, missing_nodes: torch.Tensor):
+        """前向传播，返回条件判别分数和内部判别分数"""
+        subset_feat = self.sub_encoder(subset_nodes)
+        miss_feat = self.miss_encoder(missing_nodes)
 
-        self._init_weights()
+        # 修正：使用 torch.cat() 而不是 torch.cat[]
+        cond_score = self.cond_head(torch.cat([subset_feat, miss_feat], dim=-1))
 
-    def _init_weights(self):
-        nn.init.kaiming_normal_(self.conv1.weight, mode='fan_in', nonlinearity='linear')
-        nn.init.kaiming_normal_(self.conv2.weight, mode='fan_in', nonlinearity='linear')
-        if self.conv1.bias is not None:
-            nn.init.zeros_(self.conv1.bias)
-        if self.conv2.bias is not None:
-            nn.init.zeros_(self.conv2.bias)
+        internal_feat = self.internal_encoder(missing_nodes)
+        internal_score = self.internal_head(internal_feat)
 
-        nn.init.xavier_uniform_(self.proj.weight)
-        if self.proj.bias is not None:
-            nn.init.zeros_(self.proj.bias)
-
-    def forward(self, h_final: torch.Tensor) -> torch.Tensor:
-        B, D, N, T = h_final.shape
-
-        h = h_final.reshape(B * N, D, T)
-        h = self.conv1(h)
-        h = F.gelu(h)
-        h = self.conv2(h)
-        h = F.gelu(h)
-        h = h.view(B, D, N, T)
-
-        h = h_final + h
-        h = h.permute(0, 2, 3, 1)
-        h = self.norm(h)
-
-        y_pred = self.proj(h)
-        y_pred = y_pred.permute(0, 3, 1, 2)
-
-        return y_pred
+        return cond_score, internal_score
 
     def get_num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
-def create_stdecoder(encoder_dim: int, out_dim: int) -> STDecoder:
-    return STDecoder(in_dim=encoder_dim, out_dim=out_dim)
+def compute_hybrid_d_loss(cond_real, cond_fake, internal_real, internal_fake, alpha=0.7):
+    """混合判别器的判别损失"""
+    cond_loss = (
+            F.binary_cross_entropy_with_logits(cond_real, torch.ones_like(cond_real) * 0.9) +
+            F.binary_cross_entropy_with_logits(cond_fake, torch.zeros_like(cond_fake))
+    )
+    internal_loss = (
+            F.binary_cross_entropy_with_logits(internal_real, torch.ones_like(internal_real) * 0.9) +
+            F.binary_cross_entropy_with_logits(internal_fake, torch.zeros_like(internal_fake))
+    )
+    return alpha * cond_loss + (1 - alpha) * internal_loss
+
+
+def compute_hybrid_g_loss(cond_fake, internal_fake, alpha=0.7):
+    """混合判别器的生成器损失"""
+    cond_loss = F.binary_cross_entropy_with_logits(cond_fake, torch.ones_like(cond_fake))
+    internal_loss = F.binary_cross_entropy_with_logits(internal_fake, torch.ones_like(internal_fake))
+    return alpha * cond_loss + (1 - alpha) * internal_loss
+
+
+def create_discriminator(
+        feature_dim: int,
+        hidden_dim: int = 64
+) -> HybridNodeDiscriminator:
+    """创建混合判别器的工厂函数"""
+    return HybridNodeDiscriminator(feature_dim=feature_dim, hidden_dim=hidden_dim)
