@@ -74,6 +74,23 @@ def compute_hybrid_generator_loss(
         'missing_nodes_count': len(missing_indices)
     }
 
+def compute_real_space_mae(x_fake, x_real, missing_indices, scaler):
+    """
+    x_fake, x_real: [B, F, N, T] (标准化后的张量)
+    missing_indices: [M,] (缺失节点索引)
+    scaler: StandardScaler with scalar mean/std
+    """
+    # 提取缺失节点（在逆变换前或后均可，但必须一致）
+    x_fake_missing = x_fake[:, :, missing_indices, :]      # [B, F, M, T]
+    x_real_missing = x_real[:, :, missing_indices, :]      # [B, F, M, T]
+
+    # 逆变换到原始尺度（因为 mean/std 是标量，可直接广播）
+    x_fake_real = x_fake_missing * scaler.std + scaler.mean
+    x_real_real = x_real_missing * scaler.std + scaler.mean
+
+    # 计算 MAE（仅缺失节点）
+    mae = torch.abs(x_fake_real - x_real_real).mean()
+    return mae.item()
 
 def train_step(encoder, decoder, discriminator, x_full, idx_subset,
               opt_g, opt_d, scaler, lambda_rec, lambda_adv, 
@@ -159,6 +176,8 @@ def train_step(encoder, decoder, discriminator, x_full, idx_subset,
     scaler.update()
     
     metrics = {**d_metrics, **g_metrics}
+    if getattr(args, 'scaler', None) is not None:
+        metrics['g_mae_real'] = compute_real_space_mae(x_fake, x_full, missing_indices, args.scaler)
     return metrics
 
 
@@ -177,6 +196,7 @@ def train_epoch_hybrid(encoder, decoder, discriminator, dataloader, opt_g, opt_d
     g_rec_losses = []
     d_cond_losses = []
     d_internal_losses = []
+    g_mae_reals = []
 
     num_subset = int(args.num_nodes * args.subset_ratio)
 
@@ -205,6 +225,8 @@ def train_epoch_hybrid(encoder, decoder, discriminator, dataloader, opt_g, opt_d
         g_rec_losses.append(metrics['g_loss_rec'])
         d_cond_losses.append(metrics['d_loss_cond'])
         d_internal_losses.append(metrics['d_loss_internal'])
+        if 'g_mae_real' in metrics:
+            g_mae_reals.append(metrics['g_mae_real'])
 
         if iter_idx % args.print_every == 0:
             log_str = f"  Iter [{iter_idx:3d}/{dataloader.num_batch:3d}] "
@@ -212,6 +234,8 @@ def train_epoch_hybrid(encoder, decoder, discriminator, dataloader, opt_g, opt_d
             log_str += f"(cond: {metrics['d_loss_cond']:.4f}, internal: {metrics['d_loss_internal']:.4f}) "
             log_str += f"G: {metrics['g_loss']:.4f} "
             log_str += f"Rec: {metrics['g_loss_rec']:.6f}"
+            if 'g_mae_real' in metrics:
+                log_str += f" MAE(real): {metrics['g_mae_real']:.6f}"
             print(log_str)
 
     epoch_time = time.time() - start_time
@@ -222,6 +246,7 @@ def train_epoch_hybrid(encoder, decoder, discriminator, dataloader, opt_g, opt_d
         'g_loss_rec': np.mean(g_rec_losses),
         'd_loss_cond': np.mean(d_cond_losses),
         'd_loss_internal': np.mean(d_internal_losses),
+        'g_mae_real': np.mean(g_mae_reals) if g_mae_reals else float('nan'),
         'cond_score_real': metrics.get('cond_score_real', 0.0),
         'cond_score_fake': metrics.get('cond_score_fake', 0.0),
         'internal_score_real': metrics.get('internal_score_real', 0.0),
@@ -236,6 +261,7 @@ def validate(encoder, decoder, dataloader, args):
 
     val_rec_losses = []
     num_subset = int(args.num_nodes * args.subset_ratio)
+    val_real_maes = []
 
     with torch.no_grad():
         for iter_idx, (x, y) in enumerate(dataloader.get_iterator()):
@@ -260,8 +286,15 @@ def validate(encoder, decoder, dataloader, args):
             mse = (x_missing_fake - x_missing_real)**2
             loss_rec = mse.mean()
             val_rec_losses.append(loss_rec.item())
+            if getattr(args, 'scaler', None) is not None:
+                val_real_maes.append(
+                    compute_real_space_mae(x_fake, x_full, missing_indices, args.scaler)
+                )
 
-    return {'val_rec_loss': np.mean(val_rec_losses)}
+    return {
+        'val_rec_loss': np.mean(val_rec_losses),
+        'val_mae_real': np.mean(val_real_maes) if val_real_maes else float('nan'),
+    }
 
 
 def train_loop_hybrid(encoder, decoder, discriminator, train_loader, val_loader, args):
@@ -289,6 +322,10 @@ def train_loop_hybrid(encoder, decoder, discriminator, train_loader, val_loader,
         'train_d_cond_loss': [],
         'train_d_internal_loss': [],
     }
+    history.update({
+        'train_g_mae_real': [],
+        'val_mae_real': [],
+    })
 
     print("\n" + "=" * 80)
     print(" " * 20 + "Ev3 GAN Pretraining")
@@ -330,6 +367,8 @@ def train_loop_hybrid(encoder, decoder, discriminator, train_loader, val_loader,
         history['val_rec_loss'].append(val_metrics['val_rec_loss'])
         history['train_d_cond_loss'].append(train_metrics['d_loss_cond'])
         history['train_d_internal_loss'].append(train_metrics['d_loss_internal'])
+        history['train_g_mae_real'].append(train_metrics['g_mae_real'])
+        history['val_mae_real'].append(val_metrics['val_mae_real'])
 
         # 打印总结
         print(f"\n[Epoch {epoch} Summary]")
@@ -340,7 +379,9 @@ def train_loop_hybrid(encoder, decoder, discriminator, train_loader, val_loader,
         print(f"  Internal scores - real: {train_metrics['internal_score_real']:.4f}, fake: {train_metrics['internal_score_fake']:.4f}")
         print(f"  Train G_loss: {train_metrics['g_loss']:.6f}")
         print(f"  Train Rec_loss: {train_metrics['g_loss_rec']:.6f}")
+        print(f"  Train Real-space MAE: {train_metrics['g_mae_real']:.6f}")
         print(f"  Val Rec_loss: {val_metrics['val_rec_loss']:.6f}")
+        print(f"  Val Real-space MAE: {val_metrics['val_mae_real']:.6f}")
         print(f"  Time: {train_metrics['epoch_time']:.2f}s")
         # w_init
         # w_sp = torch.sigmoid(encoder.lambda_sp).item()
@@ -472,6 +513,7 @@ def main():
     train_loader = dataloader_dict['train_loader']
     val_loader = dataloader_dict['val_loader']
     scaler_data = dataloader_dict['scaler']  # 避免与 GradScaler 命名冲突
+    args.scaler = scaler_data
 
     args.num_nodes = train_loader.num_nodes
 
