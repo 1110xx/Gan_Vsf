@@ -28,11 +28,17 @@ class TemporalEncoder(nn.Module):
 
     def __init__(self, in_dim: int, hidden_dim: int, n_layers: int = 3, dropout: float = 0.2):
         super().__init__()
+        self.hidden_dim = hidden_dim
         self.proj = nn.Conv1d(in_dim, hidden_dim, 1)
+        self.temporal_gru = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
+        self.pos_dropout = nn.Dropout(dropout)
         self.layers = nn.ModuleList()
+        self.residual_gates = nn.Parameter(torch.full((n_layers,), math.log(0.3 / 0.7)))
         for i in range(n_layers):
+            dilation = 2 ** i
+            padding = dilation
             self.layers.append(nn.Sequential(
-                nn.Conv1d(hidden_dim, hidden_dim, 3, padding=1, dilation=1),
+                nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=padding, dilation=dilation),
                 nn.BatchNorm1d(hidden_dim),
                 nn.GELU(),
                 nn.Dropout(dropout),
@@ -44,8 +50,17 @@ class TemporalEncoder(nn.Module):
         B, F, N, T = x.shape
         x = x.permute(0, 2, 1, 3).reshape(B * N, F, T)
         h = self.proj(x)
-        for layer in self.layers:
-            h = h + layer(h)
+        h = h.transpose(1, 2)
+        pos_enc = create_sinusoidal_encoding(T, self.hidden_dim).to(h.device)
+        pos_enc = pos_enc.type_as(h)
+        h = h + pos_enc.unsqueeze(0)
+        h = self.pos_dropout(h)
+        h, _ = self.temporal_gru(h)
+        h = h.transpose(1, 2)
+        for idx, layer in enumerate(self.layers):
+            residual = layer(h)
+            gate = torch.sigmoid(self.residual_gates[idx])
+            h = h + gate * residual
         h = h.reshape(B, N, -1, T)
         h = h.permute(0, 1, 3, 2)  # (B, N, T, D)
         h = self.norm(h)
@@ -67,8 +82,15 @@ class SlotAggregation(nn.Module):
         self.hidden_dim = hidden_dim
         self.n_iters = n_iters
 
-        # 可学习的 slot 初始化
-        self.slots_init = nn.Parameter(torch.randn(1, num_slots, hidden_dim) * 0.02)
+        # 修改：使用高斯分布随机初始化 slots，防止 Mode Collapse
+        # 使用共享的 mu 和 sigma (1, 1, D)，使 slots 具有交换性 (Permutation Invariant)
+        # 这种随机性对于打破对称性、让 slots 学习不同模式至关重要
+        self.slots_mu = nn.Parameter(torch.randn(1, 1, hidden_dim))
+        self.slots_log_sigma = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        
+        # 初始化参数
+        nn.init.xavier_uniform_(self.slots_mu)
+        nn.init.constant_(self.slots_log_sigma, -3.0) # sigma ≈ 0.05
 
         # Attention 投影
         self.q_proj = nn.Linear(hidden_dim, hidden_dim)
@@ -88,6 +110,8 @@ class SlotAggregation(nn.Module):
 
         self.norm_slots = nn.LayerNorm(hidden_dim)
         self.norm_inputs = nn.LayerNorm(hidden_dim)
+        self.temporal_mix_gate = nn.Parameter(torch.tensor(0.0))
+        self.mlp_residual_gate = nn.Parameter(torch.tensor(-1.0))
 
     def forward(self, h_obs: torch.Tensor, density: float):
         """
@@ -100,16 +124,29 @@ class SlotAggregation(nn.Module):
         K = self.num_slots
         device = h_obs.device
 
-        # 对每个时间步独立做 Slot Attention
+        # 对每个时间步做 Slot Attention，保留跨时间的记忆
         slots_all_t = []
+        time_encoding = create_sinusoidal_encoding(T, D).to(device)
+        time_encoding = time_encoding.type_as(h_obs)
+        prev_slots = None
 
         for t in range(T):
             h_t = h_obs[:, :, :, t]  # (B, D, N_obs)
             h_t = h_t.permute(0, 2, 1)  # (B, N_obs, D)
             h_t = self.norm_inputs(h_t)
+            time_code = time_encoding[t].view(1, 1, -1)
+            h_t = h_t + time_code
 
-            # 初始化 slots
-            slots = self.slots_init.expand(B, -1, -1).clone()  # (B, K, D)
+            # 修改：从高斯分布采样初始化 slots
+            # 引入随机噪声是解决 Mode Collapse 的关键
+            mu = self.slots_mu.expand(B, K, -1)
+            sigma = self.slots_log_sigma.exp().expand(B, K, -1)
+            noise_slots = mu + sigma * torch.randn_like(mu)
+            if prev_slots is None:
+                slots = noise_slots
+            else:
+                mix = torch.sigmoid(self.temporal_mix_gate)
+                slots = mix * prev_slots + (1 - mix) * noise_slots
 
             # 迭代更新 slots
             for _ in range(self.n_iters):
@@ -136,9 +173,15 @@ class SlotAggregation(nn.Module):
                 ).reshape(B, K, D)
 
                 # MLP
-                slots = slots + self.mlp(slots)
+                residual = self.mlp(slots)
+                residual_gate = torch.sigmoid(self.mlp_residual_gate)
+                slots = slots + residual_gate * residual
 
-            slots_all_t.append(slots)
+            slots_content = slots
+            slots_with_time = slots_content + time_code
+            prev_slots = slots_content
+
+            slots_all_t.append(slots_with_time)
 
         # Stack: (B, K, D, T)
         slots_out = torch.stack(slots_all_t, dim=-1)
@@ -181,6 +224,7 @@ class SinusoidalCrossAttention(nn.Module):
 
         self.norm = nn.LayerNorm(hidden_dim)
         self.dropout = nn.Dropout(dropout)
+        self.residual_gate = nn.Parameter(torch.tensor(-0.5))
 
     def forward(self, slots: torch.Tensor, idx_obs: torch.Tensor, density: float):
         """
@@ -201,12 +245,15 @@ class SinusoidalCrossAttention(nn.Module):
         query_base = self.query_net(query_input)  # (N_all, D)
 
         h_all_list = []
+        time_encoding = create_sinusoidal_encoding(T, D).to(device)
+        time_encoding = time_encoding.type_as(slots)
 
         for t in range(T):
             slots_t = slots[:, :, :, t]  # (B, K, D)
 
             # Query
-            q = query_base.unsqueeze(0).expand(B, -1, -1)  # (B, N_all, D)
+            query_t = query_base + time_encoding[t].unsqueeze(0)
+            q = query_t.unsqueeze(0).expand(B, -1, -1)  # (B, N_all, D)
             q = self.q_proj(q)
 
             # Key, Value from slots
@@ -226,7 +273,8 @@ class SinusoidalCrossAttention(nn.Module):
             out = torch.matmul(attn, v)  # (B, heads, N_all, head_dim)
             out = out.transpose(1, 2).reshape(B, N_all, D)
             out = self.out_proj(out)
-            out = self.norm(query_base.unsqueeze(0) + out)
+            residual_gate = torch.sigmoid(self.residual_gate)
+            out = self.norm(query_t.unsqueeze(0) + residual_gate * out)
 
             h_all_list.append(out)
 
@@ -298,7 +346,9 @@ class SlotBasedEncoder(nn.Module):
         )
 
         # 观测节点注入
-        self.inject_gate = nn.Parameter(torch.tensor(0.5))
+        # 初始化为负值 (e.g. -2.0 -> sigmoid ≈ 0.12)，使初始阶段更倾向于使用 h_obs (直接特征)
+        # 避免模型在训练初期过度依赖尚未训练好的 slots (h_all)
+        self.inject_gate = nn.Parameter(torch.tensor(-2.0))
 
     def forward(
         self,
