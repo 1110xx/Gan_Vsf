@@ -1,0 +1,604 @@
+"""
+预测头 V6 - 去除平滑约束，直接映射
+
+============================================
+核心改进（基于 TGCN/MTGNN/ASTGCN 分析）：
+============================================
+
+V5 的瓶颈：
+    1. 多项式趋势只有 4 个系数，无法表达 T_out 个独立变化
+    2. 起始点锚定压制了早期波动
+    3. 融合权重让趋势主导，细节被忽略
+
+V6 的解决方案：
+    1. 去掉多项式趋势，每个输出时间步有独立参数
+    2. 使用多尺度 TCN 捕捉不同频率的模式
+    3. 跳跃连接保留高频细节
+    4. 可选的 GRU 状态传递
+
+参考模型：
+    - TGCN: Linear(hidden_dim → T_out) 直接映射
+    - MTGNN: 膨胀卷积 + 跳跃连接
+    - ASTGCN: 时空注意力
+
+提供三种预测头选择：
+    1. DirectPredHead: 最简单，直接映射
+    2. TCNPredHead: 多尺度 TCN + 跳跃连接
+    3. HybridPredHead: GRU 状态传递 + 直接映射
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from typing import Optional, Tuple
+
+
+class DirectPredHead(nn.Module):
+    """
+    直接映射预测头（最简单，参考 TGCN）
+
+    核心思想：
+        用 Linear 直接将 encoder 特征映射到 T_out 个输出
+        每个输出时间步有独立的权重，没有平滑约束
+
+    优点：
+        - 简单有效
+        - 无平滑约束，可以预测任意波动
+        - 参数少，不易过拟合
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_nodes: int,
+        seq_in_len: int,
+        seq_out_len: int,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_nodes = num_nodes
+        self.seq_in_len = seq_in_len
+        self.seq_out_len = seq_out_len
+
+        # ========== 1. 状态提取器 ==========
+        # 从 encoder 输出提取节点状态
+        self.state_extractor = nn.Sequential(
+            nn.Linear(hidden_dim * seq_in_len, hidden_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim)
+        )
+
+        # ========== 2. 直接映射到 T_out（关键！）==========
+        # 每个输出时间步有独立的权重
+        self.output_proj = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, seq_out_len)  # D → T_out
+        )
+
+        # ========== 3. 节点特定偏置（保留节点差异）==========
+        self.node_bias = nn.Parameter(torch.zeros(num_nodes, seq_out_len))
+
+        self._init_weights()
+
+        param_count = sum(p.numel() for p in self.parameters())
+        print(f"✓ Created DirectPredHead V6 with {param_count:,} parameters")
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(
+        self,
+        h_all: torch.Tensor,
+        x_last: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Args:
+            h_all: (B, D, N, T_in) - Encoder 输出
+            x_last: (B, 1, N) - 可选，未使用
+
+        Returns:
+            pred: (B, 1, N, T_out)
+        """
+        B, D, N, T_in = h_all.shape
+
+        # 1. 提取节点状态
+        h_flat = h_all.permute(0, 2, 1, 3).reshape(B, N, D * T_in)
+        node_state = self.state_extractor(h_flat)  # (B, N, D)
+
+        # 2. 直接映射到 T_out
+        pred = self.output_proj(node_state)  # (B, N, T_out)
+
+        # 3. 添加节点特定偏置
+        pred = pred + self.node_bias.unsqueeze(0)  # (B, N, T_out)
+
+        # 输出格式
+        pred = pred.unsqueeze(1)  # (B, 1, N, T_out)
+
+        return pred
+
+
+class TCNPredHead(nn.Module):
+    """
+    多尺度 TCN 预测头（参考 MTGNN）
+
+    核心思想：
+        1. 使用膨胀卷积捕捉不同尺度的时序模式
+        2. 跳跃连接保留多层级特征（高频+低频）
+        3. 门控机制自适应选择信息
+        4. 最后用 Conv 映射到 T_out
+
+    优点：
+        - 多尺度特征融合
+        - 无平滑约束
+        - 门控机制增强表达能力
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_nodes: int,
+        seq_in_len: int,
+        seq_out_len: int,
+        n_layers: int = 3,
+        kernel_size: int = 3,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_nodes = num_nodes
+        self.seq_in_len = seq_in_len
+        self.seq_out_len = seq_out_len
+        self.n_layers = n_layers
+
+        # ========== 1. 输入投影 ==========
+        self.input_proj = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1)
+
+        # ========== 2. 膨胀卷积层（门控）==========
+        self.filter_convs = nn.ModuleList()
+        self.gate_convs = nn.ModuleList()
+        self.skip_convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+
+        for i in range(n_layers):
+            dilation = 2 ** i  # 1, 2, 4, ...
+            padding = (kernel_size - 1) * dilation // 2
+
+            # 门控卷积
+            self.filter_convs.append(
+                nn.Conv1d(hidden_dim, hidden_dim, kernel_size,
+                         dilation=dilation, padding=padding)
+            )
+            self.gate_convs.append(
+                nn.Conv1d(hidden_dim, hidden_dim, kernel_size,
+                         dilation=dilation, padding=padding)
+            )
+
+            # 跳跃连接
+            self.skip_convs.append(nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1))
+
+            # 归一化
+            self.norms.append(nn.LayerNorm(hidden_dim))
+
+        # ========== 3. 输出层（每个时间步独立参数）==========
+        self.end_conv1 = nn.Conv1d(hidden_dim, hidden_dim * 2, kernel_size=1)
+        self.end_conv2 = nn.Conv1d(hidden_dim * 2, seq_out_len, kernel_size=1)
+
+        # ========== 4. 节点特定偏置 ==========
+        self.node_bias = nn.Parameter(torch.zeros(num_nodes, seq_out_len))
+
+        self.dropout = nn.Dropout(dropout)
+
+        self._init_weights()
+
+        param_count = sum(p.numel() for p in self.parameters())
+        print(f"✓ Created TCNPredHead V6 with {param_count:,} parameters")
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Linear, nn.Conv1d)):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(
+        self,
+        h_all: torch.Tensor,
+        x_last: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            h_all: (B, D, N, T_in) - Encoder 输出
+            x_last: 可选，未使用
+
+        Returns:
+            pred: (B, 1, N, T_out)
+        """
+        B, D, N, T_in = h_all.shape
+
+        # (B, D, N, T_in) → (B*N, D, T_in)
+        x = h_all.permute(0, 2, 1, 3).reshape(B * N, D, T_in)
+
+        # 输入投影
+        x = self.input_proj(x)
+
+        # 累积跳跃连接
+        skip = 0
+
+        for i in range(self.n_layers):
+            residual = x
+
+            # 门控卷积
+            filter_out = torch.tanh(self.filter_convs[i](x))
+            gate_out = torch.sigmoid(self.gate_convs[i](x))
+            x = filter_out * gate_out
+
+            x = self.dropout(x)
+
+            # 跳跃连接
+            s = self.skip_convs[i](x)
+            skip = skip + s
+
+            # 残差连接
+            x = x + residual[:, :, -x.size(2):]
+
+            # 归一化
+            x = x.permute(0, 2, 1)  # (B*N, T, D)
+            x = self.norms[i](x)
+            x = x.permute(0, 2, 1)  # (B*N, D, T)
+
+        # 合并跳跃
+        x = F.relu(skip)
+
+        # 输出层：(B*N, D, T) → (B*N, T_out, 1)
+        # 先对时间维度做 mean pooling
+        x = x.mean(dim=-1, keepdim=True)  # (B*N, D, 1)
+        x = F.relu(self.end_conv1(x))      # (B*N, 2D, 1)
+        x = self.end_conv2(x)              # (B*N, T_out, 1)
+
+        # reshape
+        pred = x.squeeze(-1)  # (B*N, T_out)
+        pred = pred.reshape(B, N, self.seq_out_len)  # (B, N, T_out)
+
+        # 添加节点特定偏置
+        pred = pred + self.node_bias.unsqueeze(0)
+
+        # 输出格式
+        pred = pred.unsqueeze(1)  # (B, 1, N, T_out)
+
+        return pred
+
+
+class HybridPredHead(nn.Module):
+    """
+    混合预测头（GRU 状态传递 + 直接映射）
+
+    核心思想：
+        1. 使用 GRU 进行状态传递（保留自回归特性）
+        2. 但输出层使用独立参数（无平滑约束）
+        3. Cross-Attention 从历史 context 获取信息
+
+    与 V5 的区别：
+        - V5: 多项式趋势（4参数） + GRU 细节
+        - V6: 直接 Linear 映射（T_out 参数） + GRU 状态传递
+
+    优点：
+        - 保留状态传递，捕捉时序依赖
+        - 无平滑约束，可以预测波动
+        - Cross-Attention 增强信息获取
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_nodes: int,
+        seq_in_len: int,
+        seq_out_len: int,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        dropout: float = 0.1,
+        use_cross_attn: bool = True,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_nodes = num_nodes
+        self.seq_in_len = seq_in_len
+        self.seq_out_len = seq_out_len
+        self.use_cross_attn = use_cross_attn
+
+        # ========== 1. 状态提取器 ==========
+        self.state_extractor = nn.Sequential(
+            nn.Linear(hidden_dim * seq_in_len, hidden_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim)
+        )
+
+        # ========== 2. 位置编码 ==========
+        self.pos_embed = nn.Parameter(
+            torch.randn(seq_out_len, hidden_dim) * 0.02
+        )
+
+        # ========== 3. 节点 embedding ==========
+        self.node_embed = nn.Parameter(
+            torch.randn(num_nodes, hidden_dim) * 0.1
+        )
+
+        # ========== 4. GRU 状态传递 ==========
+        self.gru = nn.GRU(
+            input_size=hidden_dim * 2 + 1,  # pos + node + prev_pred
+            hidden_size=hidden_dim,
+            num_layers=n_layers,
+            batch_first=True,
+            dropout=dropout if n_layers > 1 else 0
+        )
+
+        # ========== 5. Cross-Attention（可选）==========
+        if use_cross_attn:
+            self.cross_attn = nn.MultiheadAttention(
+                hidden_dim, n_heads, dropout=dropout, batch_first=True
+            )
+            self.attn_norm = nn.LayerNorm(hidden_dim)
+
+        # ========== 6. 输出层（关键改进：独立参数）==========
+        # 每个时间步有独立的输出权重
+        self.output_projs = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim // 2),
+                nn.GELU(),
+                nn.Linear(hidden_dim // 2, 1)
+            ) for _ in range(seq_out_len)
+        ])
+
+        # ========== 7. 节点特定偏置 ==========
+        self.node_bias = nn.Parameter(torch.zeros(num_nodes, seq_out_len))
+
+        self._init_weights()
+
+        param_count = sum(p.numel() for p in self.parameters())
+        print(f"✓ Created HybridPredHead V6 with {param_count:,} parameters")
+        print(f"  - use_cross_attn: {use_cross_attn}")
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.GRU):
+                for name, param in m.named_parameters():
+                    if 'weight' in name:
+                        nn.init.orthogonal_(param)
+                    elif 'bias' in name:
+                        nn.init.zeros_(param)
+
+    def forward(
+        self,
+        h_all: torch.Tensor,
+        x_last: Optional[torch.Tensor] = None,
+        node_idx: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Args:
+            h_all: (B, D, N, T_in) - Encoder 输出
+            x_last: (B, 1, N) - 最后一个输入值（可选）
+
+        Returns:
+            pred: (B, 1, N, T_out)
+        """
+        B, D, N, T_in = h_all.shape
+        T_out = self.seq_out_len
+        device = h_all.device
+
+        # ========== 1. 提取节点状态 ==========
+        h_flat = h_all.permute(0, 2, 1, 3).reshape(B, N, D * T_in)
+        node_state = self.state_extractor(h_flat)  # (B, N, D)
+
+        # ========== 2. 准备 context（用于 Cross-Attention）==========
+        if self.use_cross_attn:
+            context = h_all.permute(0, 2, 3, 1).reshape(B * N, T_in, D)
+
+        # ========== 3. GRU 初始状态 ==========
+        gru_h0 = node_state.reshape(B * N, D).unsqueeze(0)
+        gru_h0 = gru_h0.expand(self.gru.num_layers, -1, -1).contiguous()
+
+        # ========== 4. 准备输入 ==========
+        # 节点 embedding
+        if node_idx is not None and len(node_idx) == N:
+            n_emb = self.node_embed[node_idx]  # (N, D)
+        else:
+            if N == self.num_nodes:
+                n_emb = self.node_embed  # (N, D)
+            else:
+                n_emb = self.node_embed[:N]
+
+        node_emb = n_emb.unsqueeze(0).expand(B, -1, -1)  # (B, N, D)
+        node_emb = node_emb.reshape(B * N, D)  # (B*N, D)
+
+        # 初始预测值
+        if x_last is not None and x_last.shape[2] == N:
+            prev_pred = x_last.squeeze(1).reshape(B * N, 1)
+        else:
+            prev_pred = torch.zeros(B * N, 1, device=device)
+
+        # ========== 5. 逐步预测 ==========
+        predictions = []
+        hidden = gru_h0
+
+        for t in range(T_out):
+            # 位置编码
+            pos_t = self.pos_embed[t].unsqueeze(0).expand(B * N, -1)  # (B*N, D)
+
+            # GRU 输入
+            gru_input = torch.cat([pos_t, node_emb, prev_pred], dim=-1)  # (B*N, 2D+1)
+            gru_input = gru_input.unsqueeze(1)  # (B*N, 1, 2D+1)
+
+            # GRU 前向
+            gru_out, hidden = self.gru(gru_input, hidden)  # (B*N, 1, D)
+            gru_out = gru_out.squeeze(1)  # (B*N, D)
+
+            # Cross-Attention（可选）
+            if self.use_cross_attn:
+                query = gru_out.unsqueeze(1)  # (B*N, 1, D)
+                attn_out, _ = self.cross_attn(query, context, context)
+                gru_out = self.attn_norm(query + attn_out).squeeze(1)  # (B*N, D)
+
+            # 输出投影（关键：每个时间步独立的投影）
+            pred_t = self.output_projs[t](gru_out)  # (B*N, 1)
+            predictions.append(pred_t)
+
+            # 更新上一步预测
+            prev_pred = pred_t
+
+        # ========== 6. 拼接预测 ==========
+        pred = torch.cat(predictions, dim=-1)  # (B*N, T_out)
+        pred = pred.reshape(B, N, T_out)  # (B, N, T_out)
+
+        # 添加节点特定偏置
+        if node_idx is not None and len(node_idx) == N:
+            bias = self.node_bias[node_idx]  # (N, T_out)
+        else:
+            if N == self.num_nodes:
+                bias = self.node_bias  # (N, T_out)
+            else:
+                bias = self.node_bias[:N]
+        pred = pred + bias.unsqueeze(0)
+
+        # 输出格式
+        pred = pred.unsqueeze(1)  # (B, 1, N, T_out)
+
+        return pred
+#============================================
+# 工厂函数
+# ============================================
+
+def create_pred_head_v6(
+    head_type: str,
+    hidden_dim: int,
+    num_nodes: int,
+    seq_in_len: int,
+    seq_out_len: int,
+    **kwargs
+) -> nn.Module:
+    """
+    创建 V6 预测头
+
+    Args:
+        head_type: 'direct' | 'tcn' | 'hybrid'
+        hidden_dim: 隐藏维度
+        num_nodes: 节点数
+        seq_in_len: 输入序列长度
+        seq_out_len: 输出序列长度
+        **kwargs: 其他参数
+
+    Returns:
+        预测头模块
+    """
+    if head_type == 'direct':
+        return DirectPredHead(
+            hidden_dim=hidden_dim,
+            num_nodes=num_nodes,
+            seq_in_len=seq_in_len,
+            seq_out_len=seq_out_len,
+            dropout=kwargs.get('dropout', 0.1)
+        )
+    elif head_type == 'tcn':
+        return TCNPredHead(
+            hidden_dim=hidden_dim,
+            num_nodes=num_nodes,
+            seq_in_len=seq_in_len,
+            seq_out_len=seq_out_len,
+            n_layers=kwargs.get('n_layers', 3),
+            kernel_size=kwargs.get('kernel_size', 3),
+            dropout=kwargs.get('dropout', 0.1)
+        )
+    elif head_type == 'hybrid':
+        return HybridPredHead(
+            hidden_dim=hidden_dim,
+            num_nodes=num_nodes,
+            seq_in_len=seq_in_len,
+            seq_out_len=seq_out_len,
+            n_heads=kwargs.get('n_heads', 4),
+            n_layers=kwargs.get('n_layers', 2),
+            dropout=kwargs.get('dropout', 0.1),
+            use_cross_attn=kwargs.get('use_cross_attn', True)
+        )
+    else:
+        raise ValueError(f"Unknown head_type: {head_type}. Choose from: direct, tcn, hybrid")
+
+
+# ============================================
+# 损失函数
+# ============================================
+
+def compute_v6_pred_loss(
+    pred_all: torch.Tensor,
+    y_subset: torch.Tensor,
+    idx_subset: torch.Tensor,
+    lambda_base: float = 1.0,
+    lambda_diff: float = 0.5,
+    lambda_var: float = 0.3,
+    loss_type: str = 'mae'
+) -> Tuple[torch.Tensor, dict]:
+    """
+    V6 预测损失函数
+
+    简化版本，只保留最重要的三个损失：
+    1. 基础预测损失
+    2. 一阶差分损失（匹配变化）
+    3. 方差匹配损失（防止平滑）
+    """
+    # 提取子集预测
+    pred_subset = pred_all[:, :, idx_subset, :]  # (B, 1, N_subset, T)
+
+    if y_subset.dim() == 3:
+        y_subset = y_subset.unsqueeze(1)
+
+    pred = pred_subset.squeeze(1)  # (B, N, T)
+    target = y_subset.squeeze(1)
+
+    # ========== 1. 基础损失 ==========
+    if loss_type == 'mae':
+        base_loss = F.l1_loss(pred, target)
+    elif loss_type == 'mse':
+        base_loss = F.mse_loss(pred, target)
+    else:
+        base_loss = F.huber_loss(pred, target, delta=0.5)
+
+    # ========== 2. 一阶差分损失 ==========
+    pred_diff = torch.diff(pred, dim=-1)
+    target_diff = torch.diff(target, dim=-1)
+    diff_loss = F.l1_loss(pred_diff, target_diff)
+
+    # ========== 3. 方差匹配损失 ==========
+    pred_var = pred.var(dim=-1).mean()
+    target_var = target.var(dim=-1).mean()
+    var_loss = F.relu(target_var - pred_var)
+
+    # ========== 总损失 ==========
+    total_loss = (
+        lambda_base * base_loss +
+        lambda_diff * diff_loss +
+        lambda_var * var_loss
+    )
+
+    loss_dict = {
+        'base_loss': base_loss.item(),
+        'diff_loss': diff_loss.item(),
+        'var_loss': var_loss.item(),
+        'pred_var': pred_var.item(),
+        'target_var': target_var.item(),
+        'var_ratio': pred_var.item() / (target_var.item() + 1e-8),
+    }
+
+    return total_loss, loss_dict
