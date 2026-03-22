@@ -1,643 +1,448 @@
+"""
+Encoder V4: 节点感知时序编码器
+
+核心改进（解决原模型问题）：
+1. 保留节点 embedding（解决"不同子集输出相同"问题）
+2. 因果时序注意力（解决"时序信息丢失"问题）
+3. 分离空间和时间编码（更清晰的职责）
+4. 去除过度压缩的 Slot Attention
+
+设计理念（类比 LLM）：
+- 节点 embedding ≈ Token embedding
+- 因果时序注意力 ≈ Causal Self-Attention
+- 空间注意力 ≈ Cross-Attention between tokens
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
+from typing import List, Union, Optional
 import numpy as np
-def gumbel_softmax_topk(logits, k, dim=-1, tau=1.0, hard=False):
+
+class SharedNodeEmbedding(nn.Module):
     """
-    可微的Top-k选择（基于Gumbel-Softmax）
+    共享节点 Embedding 模块
 
-    Args:
-        logits: (*, N) 输入logits
-        k: 选择的top-k数量
-        dim: 操作维度
-        tau: 温度参数
-        hard: 是否使用硬选择（straight-through estimator）
-
-    Returns:
-        mask: (*, N) 软mask，top-k位置接近1，其他接近0
+    用于在 Encoder、SubsetToFullExpander、PredHead 之间共享同一套节点表示。
+    这确保：
+    1. 语义一致性：同一节点在所有模块有相同的基础表示
+    2. 梯度流完整：不论节点是观测还是缺失，embedding 都能得到有效更新
+    3. 更好的泛化：训练和测试时节点表示一致
     """
-    # Gumbel noise
-    gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-10) + 1e-10)
-    perturbed_logits = (logits + gumbel_noise) / tau
 
-    # 获取top-k的阈值
-    topk_values, _ = torch.topk(perturbed_logits, k, dim=dim)
-    threshold = topk_values[..., -1:].expand_as(logits)
+    def __init__(self, num_nodes: int, hidden_dim: int, init_std: float = 0.1):
+        super().__init__()
+        self.num_nodes = num_nodes
+        self.hidden_dim = hidden_dim
+        self.embed = nn.Parameter(torch.randn(num_nodes, hidden_dim) * init_std)
 
-    # 软mask
-    soft_mask = torch.sigmoid((perturbed_logits - threshold) * 10.0)  # 陡峭的sigmoid
-
-    if hard:
-        # Straight-through estimator
-        hard_mask = (perturbed_logits >= threshold).float()
-        mask = hard_mask - soft_mask.detach() + soft_mask
-    else:
-        mask = soft_mask
-
-    return mask
-
-
-def hard_topk_mask(adj, k, dim=-1):
-    """
-    硬Top-k mask（用于推理阶段）
-    """
-    values, indices = torch.topk(adj, k, dim=dim)
-    mask = torch.zeros_like(adj)
-    mask.scatter_(dim, indices, 1.0)
-    return mask
-
-
-# ============================================================
-# 原始 nconv 模块（保持兼容性）
-# ============================================================
-
-class nconv(nn.Module):
-    """
-    原始的图卷积操作（保留用于兼容性）
-    """
-    def __init__(self):
-        super(nconv, self).__init__()
-
-    def forward(self, x, A):
+    def forward(self, idx: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
+        获取节点 embedding
+
         Args:
-            x: (B, C, N, T)
-            A: (N, N) or (N, V)
+            idx: 节点索引，如果为 None 则返回全部
+
         Returns:
-            out: (B, C, V, T)
-        """
-        x = torch.einsum('bcnt,nv->bcvt', (x, A))
-        return x.contiguous()
-
-
-# ============================================================
-# 改进的图学习模块
-# ============================================================
-
-class ImprovedGraphConstructor(nn.Module):
-    """
-    改进的自适应图学习模块
-
-    主要改进：
-    1. 移除 relu(tanh(...)) → 使用 softplus 保留负梯度
-    2. Top-k 改为 Gumbel-Softmax（训练时可微）
-    3. 邻接矩阵对称化：A = (A + A^T) / 2
-    4. 可学习的温度参数
-    """
-    def __init__(self, nnodes, k, dim, device, alpha=3, static_feat=None,
-                 use_gumbel=True, temperature=1.0):
-        super(ImprovedGraphConstructor, self).__init__()
-        self.nnodes = nnodes
-        self.k = k
-        self.dim = dim
-        self.device = device
-        self.alpha = alpha
-        self.static_feat = static_feat
-        self.use_gumbel = use_gumbel
-
-        # 可学习的温度参数
-        self.temperature = nn.Parameter(torch.tensor(temperature))
-
-        if static_feat is not None:
-            xd = static_feat.shape[1]
-            self.lin1 = nn.Linear(xd, dim)
-            self.lin2 = nn.Linear(xd, dim)
-        else:
-            self.emb1 = nn.Embedding(nnodes, dim)
-            self.emb2 = nn.Embedding(nnodes, dim)
-            self.lin1 = nn.Linear(dim, dim)
-            self.lin2 = nn.Linear(dim, dim)
-
-    def forward(self, idx=None, training=True):
-        """
-        Args:
-            idx: 节点索引 (可选)
-            training: 是否训练模式
-        Returns:
-            adj: (N, N) 邻接矩阵
+            (N, D) 或 (len(idx), D)
         """
         if idx is None:
-            idx = torch.arange(self.nnodes).to(self.device)
+            return self.embed
+        return self.embed[idx]
 
-        # 获取节点embedding
-        if self.static_feat is None:
-            nodevec1 = self.emb1(idx)
-            nodevec2 = self.emb2(idx)
-        else:
-            nodevec1 = self.static_feat[idx, :]
-            nodevec2 = nodevec1
+    def __getitem__(self, idx):
+        """支持索引访问"""
+        return self.embed[idx]
 
-        # 线性变换 + tanh激活
-        nodevec1 = torch.tanh(self.alpha * self.lin1(nodevec1))
-        nodevec2 = torch.tanh(self.alpha * self.lin2(nodevec2))
+    @property
+    def weight(self):
+        """兼容旧接口"""
+        return self.embed
+    
+def create_sinusoidal_encoding(num_positions: int, dim: int) -> torch.Tensor:
+    """创建正弦位置编码"""
+    position = torch.arange(num_positions).float().unsqueeze(1)
+    div_term = torch.exp(torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim))
 
-        # 计算相似度矩阵
-        a = torch.mm(nodevec1, nodevec2.transpose(1, 0))
+    pe = torch.zeros(num_positions, dim)
+    pe[:, 0::2] = torch.sin(position * div_term)
+    pe[:, 1::2] = torch.cos(position * div_term)
 
-        # 对称化
-        adj = (a + a.T) / 2
+    return pe
 
-        # 使用 softplus 替代 relu(tanh(...))，保留负梯度
-        adj = F.softplus(adj) - 0.5  # 中心化
-
-        # Top-k 稀疏化
-        if self.use_gumbel and training:
-            # Gumbel-Softmax 软稀疏化（可微）
-            mask = gumbel_softmax_topk(adj, self.k, dim=1, tau=self.temperature, hard=False)
-        else:
-            # 硬稀疏化（推理阶段）
-            mask = hard_topk_mask(adj, self.k, dim=1)
-
-        # 应用mask，但保留原始值（不是全设为1）
-        adj = adj * mask
-
-        # 确保非负
-        adj = F.relu(adj)
-
-        return adj
-
-
-class graph_constructor(nn.Module):
+class NodeAwareTemporalEncoder(nn.Module):
     """
-    原始graph_constructor的包装器（向后兼容）
-    内部使用ImprovedGraphConstructor
+    节点感知的时序编码器
+
+    关键设计：
+    1. 每个节点有独立的 embedding（保留节点差异）
+    2. 时序使用因果注意力（学习时间因果）
+    3. 空间使用交叉注意力（学习节点关系）
+    4. 【V4.1】支持共享节点 embedding，确保语义一致性
     """
-    def __init__(self, nnodes, k, dim, device, alpha=3, static_feat=None):
-        super(graph_constructor, self).__init__()
-        self.improved = ImprovedGraphConstructor(
-            nnodes, k, dim, device, alpha, static_feat
+
+    def __init__(
+        self,
+        num_nodes: int,
+        in_dim: int,
+        hidden_dim: int,
+        n_layers: int = 4,
+        n_heads: int = 4,
+        dropout: float = 0.1,
+        device: str = 'cuda',
+        shared_node_embed: Optional[SharedNodeEmbedding] = None
+    ):
+        super().__init__()
+        self.num_nodes = num_nodes
+        self.hidden_dim = hidden_dim
+        self.n_layers = n_layers
+
+        # ========== 输入投影 ==========
+        self.input_proj = nn.Sequential(
+            nn.Conv1d(in_dim, hidden_dim, 1),
+            nn.LayerNorm([hidden_dim]),  # 注意：这里需要调整
         )
-        self.nnodes = nnodes
-        self.k = k
-        self.dim = dim
-        self.device = device
-        self.alpha = alpha
-        self.static_feat = static_feat
+        # 使用 1D 卷积后的 LayerNorm
+        self.input_norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, idx=None):
-        training = self.training
-        return self.improved(idx, training)
+        # ========== 节点 Embedding（关键！）==========
+        # 【V4.1】支持共享 embedding 或自己创建
+        if shared_node_embed is not None:
+            self.node_embed = shared_node_embed
+            self._owns_node_embed = False
+        else:
+            # 向后兼容：如果没有传入共享 embedding，自己创建
+            self.node_embed = SharedNodeEmbedding(num_nodes, hidden_dim, init_std=0.1)
+            self._owns_node_embed = True
 
-# ============================================================
-# 改进的图卷积层
-# ============================================================
+        # ========== 时序位置编码 ==========
+        # 固定正弦编码（非学习）
+        self.register_buffer('time_pe', create_sinusoidal_encoding(512, hidden_dim))
 
-class ImprovedGraphConvLayer(nn.Module):
-    """
-    改进的图卷积层
-
-    主要改进：
-    1. 标准对称归一化：D^(-1/2) A D^(-1/2)
-    2. Highway Network 替代低alpha残差
-    3. 移除mask覆盖机制
-    4. 简化维度变换
-    """
-    def __init__(self, in_dim, out_dim, dropout=0.3, residual=True, use_highway=True):
-        super(ImprovedGraphConvLayer, self).__init__()
-        self.in_dim = in_dim
-        self.out_dim = out_dim
-        self.residual = residual
-        self.use_highway = use_highway
-
-        self.mlp = nn.Linear(in_dim, out_dim)
-        self.dropout = nn.Dropout(dropout)
-
-        # Highway gate
-        if residual and use_highway and in_dim == out_dim:
-            self.gate = nn.Sequential(
-                nn.Linear(in_dim + out_dim, out_dim),
-                nn.Sigmoid()
+        # ========== 编码层 ==========
+        self.layers = nn.ModuleList()
+        for i in range(n_layers):
+            self.layers.append(
+                EncoderLayer(hidden_dim, n_heads, dropout)
             )
-        else:
-            self.gate = None
 
-    def normalize_adj(self, adj):
-        """
-        对称归一化：D^(-1/2) A D^(-1/2)
-        """
-        # 添加自环
-        adj = adj + torch.eye(adj.size(0), device=adj.device)
-
-        # 计算度矩阵的逆平方根
-        d = adj.sum(1)
-        d_inv_sqrt = torch.pow(d, -0.5)
-        d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.0
-
-        # 对称归一化
-        norm_adj = adj * d_inv_sqrt.view(-1, 1) * d_inv_sqrt.view(1, -1)
-
-        return norm_adj
-
-    def forward(self, x, adj):
-        """
-        Args:
-            x: (B, N, C) 节点特征
-            adj: (N, N) 邻接矩阵
-        Returns:
-            out: (B, N, C') 输出特征
-        """
-        # 归一化邻接矩阵
-        norm_adj = self.normalize_adj(adj)
-
-        # 图卷积：(B, N, C) @ (N, N) → (B, N, C)
-        h = torch.einsum('bnc,nm->bmc', x, norm_adj)
-
-        # MLP变换
-        h = self.mlp(h)
-        h = self.dropout(h)
-
-        # Highway residual
-        if self.gate is not None:
-            gate_input = torch.cat([x, h], dim=-1)
-            gate = self.gate(gate_input)
-            out = gate * h + (1 - gate) * x
-        elif self.residual and self.in_dim == self.out_dim:
-            out = 0.5 * x + 0.5 * h  # 简单残差
-        else:
-            out = h
-
-        return out
-
-
-class GraphConvLayer(nn.Module):
-    """
-    原始GraphConvLayer的包装器（向后兼容）
-    内部使用ImprovedGraphConvLayer
-    """
-    def __init__(self, in_dim, out_dim, dropout=0.3, alpha=0.05):
-        super(GraphConvLayer, self).__init__()
-        self.improved = ImprovedGraphConvLayer(in_dim, out_dim, dropout, residual=True)
-        self.alpha = alpha  # 保留以兼容
-
-    def forward(self, x, adj, mask=None):
-        # 忽略mask参数，使用改进版本
-        return self.improved(x, adj)
-
-# ============================================================
-# SubsetEncoder（保持不变）
-# ============================================================
-
-class SubsetEncoder(nn.Module):
-    """
-    子集编码器（保持原有实现）
-    """
-    def __init__(self, params):
-        super(SubsetEncoder, self).__init__()
-        self.seq_in_len = params['seq_in_len']
-        self.in_dim = params['in_dim']
-
-        # Encoder params
-        self.encoder_lstm_units = params.get('encoder_lstm_units', 128)
-        self.conv_filters = params.get('conv_filters', 64)
-        self.kernel_size = params.get('kernel_size', 3)
-        self.dropout = params.get('dropout', 0.3)
-        self.use_dropout = params.get('use_dropout', True)
-        self.use_batchnorm = params.get('use_batchnorm', True)
-
-        # LSTM encoder
-        self.encoder_lstm = nn.LSTM(
-            input_size=self.in_dim,
-            hidden_size=self.encoder_lstm_units,
-            batch_first=True,
-            dropout=self.dropout if self.use_dropout else 0.0
+        # ========== 子集到全集的扩展模块 ==========
+        # 【V4.1】传入共享的 node_embed
+        self.subset_to_full = SubsetToFullExpander(
+            hidden_dim, num_nodes, n_heads, dropout,
+            shared_node_embed=self.node_embed
         )
 
-        # Conv encoder
-        self.conv_layers = nn.ModuleList()
-        self.conv_layers.append(
-            nn.Conv1d(
-                in_channels=self.in_dim,
-                out_channels=self.conv_filters,
-                kernel_size=self.kernel_size,
-                padding=self.kernel_size // 2
-            )
-        )
-        for _ in range(3):
-            self.conv_layers.append(
-                nn.Conv1d(
-                    in_channels=self.conv_filters,
-                    out_channels=self.conv_filters,
-                    kernel_size=self.kernel_size,
-                    padding=self.kernel_size // 2
-                )
-            )
+        self.final_norm = nn.LayerNorm(hidden_dim)
 
-        self.batch_norms = nn.ModuleList([
-            nn.BatchNorm1d(self.conv_filters) for _ in range(4)
-        ]) if self.use_batchnorm else None
+    def get_shared_node_embed(self) -> SharedNodeEmbedding:
+        """获取共享的节点 embedding，供 PredHead 使用"""
+        return self.node_embed
 
-        # Embedding 维度
-        self.embedding_dim = self.encoder_lstm_units + self.conv_filters
-
-    def forward(self, x):
+    def forward(
+        self,
+        x_subset: torch.Tensor,
+        idx_subset: Union[torch.Tensor, np.ndarray, List],
+        return_obs_clean: bool = False
+    ) -> Union[torch.Tensor, tuple]:
         """
-        Args:
-            x: (B, F, N, T)
-        Returns:
-            embedding: (B, N, embedding_dim)
+        x_subset: (B, F, N_obs, T)
+        idx_subset: 观测节点索引
+
+        返回: 
+        (B, D, N_all, T) 或 ((B, D, N_all, T), (B, D, N_obs, T))
         """
-        batch_size = x.size(0)
-        num_nodes_subset = x.size(2)
+        B, F, N_obs, T = x_subset.shape
+        device = x_subset.device
 
-        # (B, F, N, T) → (B, N, F, T)
-        x = x.permute(0, 2, 1, 3)
-
-        # LSTM encoder
-        x_lstm = x.permute(0, 1, 3, 2)  # (B, N, T, F)
-        x_lstm = x_lstm.reshape(batch_size * num_nodes_subset, self.seq_in_len, self.in_dim)
-        lstm_out, _ = self.encoder_lstm(x_lstm)
-        lstm_features = lstm_out[:, -1, :]  # (B*N, hidden)
-
-        # Conv encoder
-        x_conv = x.reshape(batch_size * num_nodes_subset, self.in_dim, self.seq_in_len)
-        conv_out = x_conv
-        for i, conv_layer in enumerate(self.conv_layers):
-            conv_out = conv_layer(conv_out)
-            if self.batch_norms is not None:
-                conv_out = self.batch_norms[i](conv_out)
-            conv_out = torch.relu(conv_out)
-        conv_features = conv_out[:, :, -1]  # (B*N, filters)
-
-        # 组合embedding
-        embedding = torch.cat([lstm_features, conv_features], dim=-1)
-        embedding = embedding.reshape(batch_size, num_nodes_subset, -1)
-
-        return embedding
-
-# ============================================================
-# 改进的 Embedding Expander
-# ============================================================
-
-class ImprovedEmbeddingExpander(nn.Module):
-    """
-    改进的 Embedding 扩展模块
-
-    主要改进：
-    1. 未观测节点使用可学习初始化（而非全0）
-    2. Learnable Diffusion Gate 替代 hard mask
-    3. 移除最后的强制还原
-    4. Confidence-based 信息融合
-    """
-    def __init__(self, params):
-        super(ImprovedEmbeddingExpander, self).__init__()
-        self.num_nodes = params['num_nodes']
-        self.embedding_dim = params.get('encoder_lstm_units', 128) + params.get('conv_filters', 64)
-        self.device = params.get('device', 'cuda')
-
-        # 图传播参数
-        self.num_graph_layers = params.get('num_recon_graph_layers', 3)
-        self.graph_dropout = params.get('recon_dropout', 0.3)
-        self.use_adaptive_graph = params.get('use_adaptive_graph', True)
-
-        # 预定义邻接矩阵
-        self.predefined_adj = params.get('predefined_A', None)
-
-        # 优化：预先归一化
-        self.predefined_adj_normalized = None
-        if self.predefined_adj is not None:
-            adj_with_self = self.predefined_adj + torch.eye(self.num_nodes).to(self.device)
-            d = adj_with_self.sum(1)
-            d_inv_sqrt = torch.pow(d, -0.5)
-            d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.0
-            self.predefined_adj_normalized = adj_with_self * d_inv_sqrt.view(-1, 1) * d_inv_sqrt.view(1, -1)
-
-        # 自适应图学习
-        if self.use_adaptive_graph:
-            self.graph_constructor = graph_constructor(
-                nnodes=self.num_nodes,
-                k=params.get('graph_k', 10),
-                dim=params.get('node_dim', 40),
-                device=self.device,
-                alpha=3
-            )
-
-        # 未观测节点的可学习初始化
-        self.unobserved_init = nn.Parameter(
-            torch.randn(1, 1, self.embedding_dim) * 0.01
-        )
-
-        # 多层图卷积
-        self.graph_layers = nn.ModuleList()
-        hidden_dim = params.get('recon_hidden_dim', self.embedding_dim)
-
-        for i in range(self.num_graph_layers):
-            in_dim = self.embedding_dim if i == 0 else hidden_dim
-            out_dim = hidden_dim if i < self.num_graph_layers - 1 else self.embedding_dim
-            self.graph_layers.append(
-                ImprovedGraphConvLayer(
-                    in_dim,
-                    out_dim,
-                    dropout=self.graph_dropout,
-                    residual=True,
-                    use_highway=True
-                )
-            )
-
-        # Learnable Diffusion Gates
-        self.diffusion_gates = nn.ModuleList()
-        for i in range(self.num_graph_layers):
-            in_dim = self.embedding_dim if i == 0 else hidden_dim
-            out_dim = hidden_dim if i < self.num_graph_layers - 1 else self.embedding_dim
-            self.diffusion_gates.append(
-                nn.Sequential(
-                    nn.Linear(in_dim + out_dim, out_dim),
-                    nn.Sigmoid()
-                )
-            )
-
-        # Confidence传播参数
-        self.confidence_alpha = nn.Parameter(torch.tensor(0.3))
-
-    def preprocess_embedding(self, subset_embedding, idx_subset, device):
-        """
-        初始化全局embedding（改进版）
-
-        Args:
-            subset_embedding: (B, N_subset, D)
-            idx_subset: (B, N_subset) or (N_subset,)
-        Returns:
-            full_embedding: (B, N_all, D)
-            confidence: (B, N_all, 1) - 置信度
-        """
-        batch_size = subset_embedding.size(0)
-        embedding_dim = subset_embedding.size(2)
-
-        # 初始化：未观测节点使用可学习embedding
-        full_embedding = self.unobserved_init.expand(batch_size, self.num_nodes, -1).clone()
-
-        # 确保 idx_subset 是 Tensor
+        # 处理索引
         if isinstance(idx_subset, np.ndarray):
             idx_subset = torch.from_numpy(idx_subset).to(device)
         elif isinstance(idx_subset, list):
             idx_subset = torch.tensor(idx_subset, device=device)
 
-        # 填充子集位置
-        if idx_subset.dim() == 1:
-            # 单个batch：(N_subset,)
-            full_embedding[:, idx_subset, :] = subset_embedding
-        else:
-            # 多batch：(B, N_subset)
-            for b in range(batch_size):
-                full_embedding[b, idx_subset[b], :] = subset_embedding[b]
+        # ========== 1. 输入投影 ==========
+        # (B, F, N_obs, T) → (B*N_obs, F, T) → (B*N_obs, D, T)
+        x = x_subset.permute(0, 2, 1, 3).reshape(B * N_obs, F, T)
+        x = self.input_proj[0](x)  # Conv1d
+        x = x.permute(0, 2, 1)  # (B*N_obs, T, D)
+        x = self.input_norm(x)
 
-        # 创建confidence mask
-        confidence = torch.zeros(batch_size, self.num_nodes, 1, device=device)
-        if idx_subset.dim() == 1:
-            confidence[:, idx_subset, :] = 1.0
-        else:
-            for b in range(batch_size):
-                confidence[b, idx_subset[b], :] = 1.0
+        # ========== 2. 添加节点 embedding ==========
+        # 取出观测节点的 embedding（使用共享 embedding）
+        node_emb = self.node_embed(idx_subset)  # (N_obs, D)
+        node_emb = node_emb.unsqueeze(0).unsqueeze(2)  # (1, N_obs, 1, D)
+        node_emb = node_emb.expand(B, -1, T, -1)  # (B, N_obs, T, D)
+        node_emb = node_emb.reshape(B * N_obs, T, -1)  # (B*N_obs, T, D)
 
-        return full_embedding, confidence
+        x = x + node_emb
 
-    def get_adjacency_matrix(self, idx=None):
+        # ========== 3. 添加时序位置编码 ==========
+        time_pe = self.time_pe[:T, :].unsqueeze(0)  # (1, T, D)
+        x = x + time_pe
+
+        # ========== 4. 编码层（时序 + 空间交替）==========
+        # (B*N_obs, T, D) → (B, N_obs, T, D)
+        x = x.reshape(B, N_obs, T, -1)
+
+        for layer in self.layers:
+            x = layer(x)
+
+        x = self.final_norm(x)
+
+        # 可选返回观测子集的干净表示
+        h_obs_clean = x.permute(0, 3, 1, 2)  # (B, D, N_obs, T)
+
+        # ========== 5. 扩展到全集 ==========
+        # x: (B, N_obs, T, D) → (B, N_all, T, D)
+        h_all = self.subset_to_full(x, idx_subset)
+
+        # (B, N_all, T, D) → (B, D, N_all, T)
+        h_all = h_all.permute(0, 3, 1, 2)
+
+        if return_obs_clean:
+            return h_all, h_obs_clean
+        return h_all
+    
+    def replace_obs_with_clean(
+        self,
+        h_all: torch.Tensor,
+        h_obs_clean: torch.Tensor,
+        idx_subset: Union[torch.Tensor, np.ndarray, List]
+    ) -> torch.Tensor:
         """
-        获取邻接矩阵（保持向后兼容）
+        使用干净的观测子集表示替换全集中的对应部分
+
+        h_all: (B, D, N_all, T)
+        h_obs_clean: (B, D, N_obs, T)
+        idx_subset: 观测节点索引
+
+        返回:
+        (B, D, N_all, T)
         """
-        if self.predefined_adj is not None:
-            return self.predefined_adj
-        elif self.use_adaptive_graph:
-            return self.graph_constructor(idx)
-        else:
-            return torch.eye(self.num_nodes).to(self.device)
+        h_all_fixed = h_all.clone()
+        h_all_fixed[:, :, idx_subset, :] = h_obs_clean
+        return h_all_fixed  
 
-    def forward(self, subset_embedding, idx_subset, args=None):
-        """
-        Args:
-            subset_embedding: (B, N_subset, D)
-            idx_subset: (N_subset,) 或 (B, N_subset)
-            args: 额外参数
-        Returns:
-            global_embedding: (B, N_all, D)
-        """
-        device = subset_embedding.device
-        batch_size = subset_embedding.size(0)
 
-        # 初始化
-        h, confidence = self.preprocess_embedding(subset_embedding, idx_subset, device)
-
-        # 获取邻接矩阵
-        adj = self.get_adjacency_matrix()
-
-        # 归一化邻接矩阵（用于confidence传播）
-        if self.predefined_adj_normalized is not None:
-            adj_norm = self.predefined_adj_normalized
-        else:
-            adj_with_self = adj + torch.eye(adj.size(0), device=device)
-            d = adj_with_self.sum(1)
-            d_inv_sqrt = torch.pow(d, -0.5)
-            d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.0
-            adj_norm = adj_with_self * d_inv_sqrt.view(-1, 1) * d_inv_sqrt.view(1, -1)
-
-        # 多层GCN传播
-        for i, (gcn_layer, gate_layer) in enumerate(zip(self.graph_layers, self.diffusion_gates)):
-            h_prev = h
-
-            # GCN传播（不mask输入，让梯度流通）
-            h_gcn = gcn_layer(h, adj)
-
-            # Learnable gate：决定接受多少新信息
-            gate_input = torch.cat([h_prev, h_gcn], dim=-1)
-            gate = gate_layer(gate_input)
-
-            # Confidence-based融合
-            # 观测节点：保留原始信息为主，GCN为辅
-            # 未观测节点：GCN信息为主
-            if h_prev.size(-1) == h_gcn.size(-1):
-                # 维度相同：gate控制h_prev和h_gcn的融合比例
-                h_intermediate = gate * h_prev + (1 - gate) * h_gcn
-            else:
-                # 维度不同：直接使用h_gcn（维度已通过GCN层转换）
-                h_intermediate = gate * h_gcn
-
-                # 根据confidence决定观测节点和未观测节点的策略
-                # 观测节点：使用gate控制的融合结果
-                # 未观测节点：直接使用GCN输出
-            h = confidence * h_intermediate + (1 - confidence) * h_gcn
-
-            # 传播confidence（邻居传播）
-            if i < len(self.graph_layers) - 1:
-                # (B, N, 1) @ (N, N) → (B, N, 1)
-                neighbor_confidence = torch.bmm(
-                    confidence.transpose(1, 2),  # (B, 1, N)
-                    adj_norm.unsqueeze(0).expand(batch_size, -1, -1)  # (B, N, N)
-                ).transpose(1, 2)  # (B, N, 1)
-
-                # 更新confidence
-                alpha = torch.sigmoid(self.confidence_alpha)
-                confidence = torch.clamp(confidence + alpha * neighbor_confidence, 0.0, 1.0)
-
-        return h
-
-class EmbeddingExpander(nn.Module):
+class EncoderLayer(nn.Module):
     """
-    原始EmbeddingExpander的包装器（向后兼容）
+    编码器层：时序注意力 + 空间注意力 + FFN
     """
+    def __init__(self, hidden_dim: int, n_heads: int, dropout: float):
+        super().__init__()
 
-    def __init__(self, params):
-        super(EmbeddingExpander, self).__init__()
-        self.improved = ImprovedEmbeddingExpander(params)
-        self.num_nodes = params['num_nodes']
-        self.embedding_dim = params.get('encoder_lstm_units', 128) + params.get('conv_filters', 64)
-        self.device = params.get('device', 'cuda')
-        self.use_adaptive_graph = params.get('use_adaptive_graph', True)
-        self.predefined_adj = params.get('predefined_A', None)
+        # 时序注意力（因果）
+        self.temporal_attn = CausalTemporalAttention(hidden_dim, n_heads, dropout)
+        self.norm1 = nn.LayerNorm(hidden_dim)
 
-        # 兼容性：暴露内部模块
-        if self.use_adaptive_graph:
-            self.graph_constructor = self.improved.graph_constructor
+        # 空间注意力（节点间）
+        self.spatial_attn = SpatialAttention(hidden_dim, n_heads, dropout)
+        self.norm2 = nn.LayerNorm(hidden_dim)
 
-    def get_adjacency_matrix(self, idx=None):
-        return self.improved.get_adjacency_matrix(idx)
+        # FFN
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.Dropout(dropout)
+        )
+        self.norm3 = nn.LayerNorm(hidden_dim)
 
-    def forward(self, subset_embedding, idx_subset, args=None):
-        return self.improved(subset_embedding, idx_subset, args)
+    def forward(self, x):
+        """x: (B, N, T, D)"""
+        # 时序注意力
+        residual = x
+        x = self.norm1(x)
+        x = residual + self.temporal_attn(x)
 
-    # ============================================================
-    # Global Embedding Encoder（保持不变）
-    # ============================================================
+        # 空间注意力
+        residual = x
+        x = self.norm2(x)
+        x = residual + self.spatial_attn(x)
 
-class GlobalEmbeddingEncoder(nn.Module):
+        # FFN
+        residual = x
+        x = self.norm3(x)
+        x = residual + self.ffn(x)
+
+        return x
+
+
+class CausalTemporalAttention(nn.Module):
     """
-    全局Embedding编码器
+    因果时序注意力
+
+    关键：每个时间步只能看到之前的时间步（因果掩码）
+    这让模型学习时间因果关系
     """
+    def __init__(self, hidden_dim: int, n_heads: int, dropout: float):
+        super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = hidden_dim // n_heads
+        self.scale = self.head_dim ** -0.5
 
-    def __init__(self, params):
-        super(GlobalEmbeddingEncoder, self).__init__()
-        self.subset_encoder = SubsetEncoder(params)
-        # 检查 是否使用 imputer
-        self.use_imputer = params.get('use_embedding_imputer', False)
+        self.qkv = nn.Linear(hidden_dim, hidden_dim * 3)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.dropout = nn.Dropout(dropout)
 
-        if self.use_imputer:
-            # 使用 GRUI Imputer
-            try:
-                from .embedding_imputer import EmbeddingImputer
-                self.imputer = EmbeddingImputer(params)
-                print("使用 GRUImputer 进行缺失值填充")
-            except ImportError:
-                raise ImportError("GRUImputer 模块未找到，请检查是否已安装")
-                self.use_imputer = False
-                self.embedding_expander = EmbeddingExpander(params)
-        else:
-            self.embedding_expander = EmbeddingExpander(params)
-            print("使用 EmbeddingExpander 进行缺失值填充")
+    def forward(self, x):
+        """x: (B, N, T, D)"""
+        B, N, T, D = x.shape
 
-        
-        self.embedding_dim = self.subset_encoder.embedding_dim
-            
+        # (B, N, T, D) → (B*N, T, D)
+        x = x.reshape(B * N, T, D)
 
-    def forward(self, x, idx_subset, args=None):
+        # QKV 投影
+        qkv = self.qkv(x).reshape(B * N, T, 3, self.n_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B*N, heads, T, head_dim)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        # 注意力分数
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # (B*N, heads, T, T)
+
+        # 因果掩码
+        causal_mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        attn = attn.masked_fill(causal_mask, float('-inf'))
+
+        attn = F.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
+
+        # 输出
+        out = (attn @ v).transpose(1, 2).reshape(B * N, T, D)
+        out = self.out_proj(out)
+
+        return out.reshape(B, N, T, D)
+
+
+class SpatialAttention(nn.Module):
+    """
+    空间注意力（节点间）
+
+    对每个时间步，计算节点间的注意力
+    """
+    def __init__(self, hidden_dim: int, n_heads: int, dropout: float):
+        super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = hidden_dim // n_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.qkv = nn.Linear(hidden_dim, hidden_dim * 3)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        """x: (B, N, T, D)"""
+        B, N, T, D = x.shape
+
+        # (B, N, T, D) → (B*T, N, D)
+        x = x.permute(0, 2, 1, 3).reshape(B * T, N, D)
+
+        # QKV 投影
+        qkv = self.qkv(x).reshape(B * T, N, 3, self.n_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        # 注意力分数（无掩码，所有节点互相可见）
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = F.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
+
+        # 输出
+        out = (attn @ v).transpose(1, 2).reshape(B * T, N, D)
+        out = self.out_proj(out)
+
+        return out.reshape(B, T, N, D).permute(0, 2, 1, 3)  # (B, N, T, D)
+
+
+class SubsetToFullExpander(nn.Module):
+    """
+    子集到全集扩展器
+
+    关键改进：
+    1. 使用交叉注意力而非 Slot（避免信息瓶颈）
+    2. 缺失节点从观测节点的上下文中获取信息
+    3. 保留节点 embedding 差异
+    4. 【V4.1】使用共享节点 embedding，确保语义一致性
+    """
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_nodes: int,
+        n_heads: int,
+        dropout: float,
+        shared_node_embed: Optional[SharedNodeEmbedding] = None
+    ):
+        super().__init__()
+        self.num_nodes = num_nodes
+        self.hidden_dim = hidden_dim
+
+        # 【V4.1】使用共享节点 embedding
+        # 不再创建独立的 embedding，而是引用共享的
+        self.node_embed = shared_node_embed  # 可能为 None（向后兼容）
+
+        # 交叉注意力：缺失节点从观测节点获取信息
+        self.cross_attn = nn.MultiheadAttention(
+            hidden_dim, n_heads, dropout=dropout, batch_first=True
+        )
+
+        self.norm = nn.LayerNorm(hidden_dim)
+
+        # 融合门控
+        self.gate = nn.Parameter(torch.tensor(-2.0))  # 初始倾向于使用原始特征
+
+    def forward(self, h_obs: torch.Tensor, idx_subset: torch.Tensor) -> torch.Tensor:
         """
-        Args:
-            x: (B, F, N_subset, T)
-            idx_subset: (N_subset,)
-        Returns:
-            global_embedding: (B, N_all, embedding_dim)
-        """
-        subset_embedding = self.subset_encoder(x)
-        if self.use_imputer:
-            global_embedding = self.imputer(subset_embedding, idx_subset, args)
-        else:
-            global_embedding = self.embedding_expander(subset_embedding, idx_subset, args)
+        h_obs: (B, N_obs, T, D)
+        idx_subset: (N_obs,)
 
-        return global_embedding
+        返回: (B, N_all, T, D)
+        """
+        B, N_obs, T, D = h_obs.shape
+        device = h_obs.device
+
+        # 创建全集输出
+        h_full = torch.zeros(B, self.num_nodes, T, D, device=device, dtype=h_obs.dtype)
+
+        # 1. 观测节点直接复制
+        h_full[:, idx_subset, :, :] = h_obs
+
+        # 2. 找出缺失节点
+        all_idx = torch.arange(self.num_nodes, device=device)
+        missing_mask = torch.ones(self.num_nodes, dtype=torch.bool, device=device)
+        missing_mask[idx_subset] = False
+        missing_idx = all_idx[missing_mask]
+
+        if len(missing_idx) == 0:
+            return h_full
+
+        # 3. 缺失节点通过交叉注意力从观测节点获取信息
+        # Query: 缺失节点的 embedding（使用共享 embedding）
+        missing_emb = self.node_embed(missing_idx)  # (N_miss, D)
+
+        # 【V4.1 优化】批量处理所有时间步，提高效率
+        # 将 (B, N_obs, T, D) 转为 (B*T, N_obs, D)
+        context_all = h_obs.permute(0, 2, 1, 3).reshape(B * T, N_obs, D)
+
+        # 将 query 扩展为 (B*T, N_miss, D)
+        query = missing_emb.unsqueeze(0).expand(B * T, -1, -1)  # (B*T, N_miss, D)
+        query = self.norm(query)
+
+        # 一次 cross-attention 处理所有时间步
+        h_missing_all, _ = self.cross_attn(query, context_all, context_all)
+
+        # 融合：节点 embedding + 上下文信息
+        gate = torch.sigmoid(self.gate)
+        h_missing_all = gate * query + (1 - gate) * h_missing_all
+
+        # reshape 回 (B, T, N_miss, D) → (B, N_miss, T, D)
+        h_missing_all = h_missing_all.reshape(B, T, len(missing_idx), D).permute(0, 2, 1, 3)
+
+        h_full[:, missing_idx, :, :] = h_missing_all
+
+        return h_full
+
+    def get_num_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)

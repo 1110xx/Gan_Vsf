@@ -31,7 +31,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from model.encoder_v4 import SharedNodeEmbedding
 
 
 class DirectPredHead(nn.Module):
@@ -307,6 +310,7 @@ class HybridPredHead(nn.Module):
         n_layers: int = 2,
         dropout: float = 0.1,
         use_cross_attn: bool = True,
+        shared_node_embed: Optional[torch.Tensor] = None
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -330,9 +334,14 @@ class HybridPredHead(nn.Module):
         )
 
         # ========== 3. 节点 embedding ==========
-        self.node_embed = nn.Parameter(
-            torch.randn(num_nodes, hidden_dim) * 0.1
-        )
+        if shared_node_embed is not None:
+            self.node_embed = shared_node_embed
+            self._owns_node_embed = False
+        else:
+            self.node_embed = nn.Parameter(
+                torch.randn(num_nodes, hidden_dim) * 0.1
+            )
+            self._owns_node_embed = True
 
         # ========== 4. GRU 状态传递 ==========
         self.gru = nn.GRU(
@@ -368,6 +377,24 @@ class HybridPredHead(nn.Module):
         param_count = sum(p.numel() for p in self.parameters())
         print(f"✓ Created HybridPredHead V6 with {param_count:,} parameters")
         print(f"  - use_cross_attn: {use_cross_attn}")
+        print(f" - shares_node_embed: {not self._owns_node_embed}")
+    
+    def _get_node_embed(self, idx:Optional[torch.Tensor]=None) -> torch.Tensor:
+        """
+        _get_node_embed 的 Docstring
+        
+        Args:
+            idx: Optional[torch.Tensor] - 节点索引（可选）
+        Returns:
+            torch.Tensor - 节点嵌入
+            (N, D) 或 (len(idx), D)
+        """
+        if hasattr(self.node_embed, 'forward'):
+            return self.node_embed(idx)
+        else:
+            if idx is None:
+                return self.node_embed
+            return self.node_embed[idx]
 
     def _init_weights(self):
         for m in self.modules():
@@ -414,23 +441,28 @@ class HybridPredHead(nn.Module):
 
         # ========== 4. 准备输入 ==========
         # 节点 embedding
-        if node_idx is not None and len(node_idx) == N:
-            n_emb = self.node_embed[node_idx]  # (N, D)
+        if N==self.num_nodes:
+            n_emb = self._get_node_embed(None)  # (N, D)
+        elif node_idx is not None and len(node_idx) == N:
+            n_emb = self._get_node_embed(node_idx)
         else:
-            if N == self.num_nodes:
-                n_emb = self.node_embed  # (N, D)
-            else:
-                n_emb = self.node_embed[:N]
-
+            n_emb = self._get_node_embed(torch.arange(N, device=device))
         node_emb = n_emb.unsqueeze(0).expand(B, -1, -1)  # (B, N, D)
         node_emb = node_emb.reshape(B * N, D)  # (B*N, D)
 
+        prev_pred = None
         # 初始预测值
         if x_last is not None and x_last.shape[2] == N:
             prev_pred = x_last.squeeze(1).reshape(B * N, 1)
         else:
+            # x_last不匹配打印警告
+            if x_last is not None:
+                import warnings
+                warnings.warn(
+                    f"pred_v6: x_last.shape[2] ({x_last.shape[2]}) != N ({N}), "
+                    f"using zeros as initial prev_pred."
+                )
             prev_pred = torch.zeros(B * N, 1, device=device)
-
         # ========== 5. 逐步预测 ==========
         predictions = []
         hidden = gru_h0
@@ -465,13 +497,12 @@ class HybridPredHead(nn.Module):
         pred = pred.reshape(B, N, T_out)  # (B, N, T_out)
 
         # 添加节点特定偏置
-        if node_idx is not None and len(node_idx) == N:
-            bias = self.node_bias[node_idx]  # (N, T_out)
+        if N == self.num_nodes:
+            bias = self.node_bias  # (N, T_out)
+        elif node_idx is not None and len(node_idx) == N:
+            bias = self.node_bias[node_idx]
         else:
-            if N == self.num_nodes:
-                bias = self.node_bias  # (N, T_out)
-            else:
-                bias = self.node_bias[:N]
+            bias = self.node_bias[:N]
         pred = pred + bias.unsqueeze(0)
 
         # 输出格式
@@ -488,6 +519,7 @@ def create_pred_head_v6(
     num_nodes: int,
     seq_in_len: int,
     seq_out_len: int,
+    shared_node_embed: Optional[nn.Module] = None,
     **kwargs
 ) -> nn.Module:
     """
@@ -531,7 +563,8 @@ def create_pred_head_v6(
             n_heads=kwargs.get('n_heads', 4),
             n_layers=kwargs.get('n_layers', 2),
             dropout=kwargs.get('dropout', 0.1),
-            use_cross_attn=kwargs.get('use_cross_attn', True)
+            use_cross_attn=kwargs.get('use_cross_attn', True),
+            shared_node_embed=shared_node_embed
         )
     else:
         raise ValueError(f"Unknown head_type: {head_type}. Choose from: direct, tcn, hybrid")
